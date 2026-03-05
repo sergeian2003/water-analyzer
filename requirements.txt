@@ -1,0 +1,15 @@
+# Web Interface & Backend
+fastapi==0.135.1
+uvicorn==0.41.0
+pywebview==6.1
+
+# Industrial Communication (RS485)
+minimalmodbus==2.1.1
+pyserial==3.5
+
+# Compilation & Packaging
+pyinstaller==6.19.0
+
+# Optional (for future mobile app/extended features)
+requests==2.32.3
+pydantic==2.12.5
