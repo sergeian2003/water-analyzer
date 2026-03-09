@@ -174,11 +174,19 @@ def modbus_worker():
                             sensor_data[key]["turb"] = f"{decode_dcba(tr_r):.2f}"
                             val_num = c_val
                             
-                        elif s_type in ["orp", "oil", "do"]:
+                        # 기존 + 추가된 센서들 (Turbidity, Conductivity)
+                        elif s_type in ["orp", "oil", "do", "turbidity", "conductivity"]:
                             read_with_retry(instr.read_register, 12288, 0, 3)
                             val = decode_dcba(read_with_retry(instr.read_registers, 9730, 2, 3))
                             fmt = "{:.1f}" if s_type == "orp" else "{:.2f}"
                             sensor_data[key]["val"] = fmt.format(val)
+                            val_num = val
+
+                        # pH 센서 전용 로직 (0x2800 주소 사용)
+                        elif s_type == "ph":
+                            read_with_retry(instr.read_register, 12288, 0, 3)
+                            val = decode_dcba(read_with_retry(instr.read_registers, 10240, 2, 3))
+                            sensor_data[key]["val"] = f"{val:.2f}"
                             val_num = val
                         
                         min_v = float(s.get("min", 0))
@@ -555,6 +563,9 @@ def get_gui():
                             <option value="do">DO (Dissolved Oxygen)</option>
                             <option value="orp">ORP</option>
                             <option value="oil">OIL IN WATER</option>
+                            <option value="ph">pH</option>
+                            <option value="turbidity">TURBIDITY</option>
+                            <option value="conductivity">CONDUCTIVITY</option>
                         </select>
                     </div>
                     <div>
@@ -612,7 +623,11 @@ def get_gui():
             let configData = null;
             let isInitialized = false;
             let charts = [];
-            const unitMap = { "mlss": "mg/L", "uv254": "mg/L", "do": "mg/L", "orp": "mV", "oil": "ug/L" };
+            // 추가된 센서들의 단위(Unit)를 등록해 줍니다.
+            const unitMap = { 
+                "mlss": "mg/L", "uv254": "mg/L", "do": "mg/L", "orp": "mV", "oil": "ug/L",
+                "ph": "pH", "turbidity": "NTU", "conductivity": "mS/cm"
+            };
 
             const iconSun = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v2.25m6.364.386l-1.591 1.591M21 12h-2.25m-.386 6.364l-1.591-1.591M12 18.75V21m-4.773-4.227l-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z" /></svg>`;
             const iconMoon = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M21.752 15.002A9.718 9.718 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 009.002-5.998z" /></svg>`;
@@ -940,7 +955,7 @@ def get_gui():
                             <div class="flex items-center">
                                 <span class="text-xs text-slate-500 mr-2">ID:</span>
                                 <input id="id-${key}" type="number" value="${s.id}" class="bg-white dark:bg-black border border-slate-300 dark:border-slate-600 w-12 text-center rounded p-1 text-slate-800 dark:text-white font-bold text-sm outline-none focus:border-cyan-500 dark:focus:border-cyan-400">
-                                <button onclick="openCalModal(${s.id}, '${s.type}', '${s.label}')" class="bg-indigo-100 text-indigo-600 hover:bg-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-400 dark:hover:bg-indigo-800/60 px-2 py-1 rounded text-[10px] font-black uppercase tracking-wider ml-2 border border-indigo-200 dark:border-indigo-800 transition-colors">CAL</button>
+                                <button onclick="openCalModal(${s.id}, '${s.type}', '${s.label}')" class="bg-indigo-100 text-indigo-600 hover:bg-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-400 dark:hover:bg-indigo-800/60 px-2 py-1 rounded text-[10px] font-black uppercase tracking-wider ml-2 border border-indigo-200 dark:border-indigo-800 transition-colors">⚙️ CAL</button>
                             </div>
                         </div>
                     </div>`;
