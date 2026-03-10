@@ -14,13 +14,16 @@ import math
 from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles # <-- Добавлено для Offline режима
 
 # === 시스템 절대 경로 고정 (바탕화면 실행 및 Kiosk 모드 방어) ===
 BASE_DIR = '/home/young/farm'
 LOG_DIR = os.path.join(BASE_DIR, 'logs')
+STATIC_DIR = os.path.join(BASE_DIR, 'static') # <-- Папка для локальных стилей
 
-# logs 폴더가 없으면 자동 생성
+# 폴더가 없으면 자동 생성
 os.makedirs(LOG_DIR, exist_ok=True) 
+os.makedirs(STATIC_DIR, exist_ok=True)
 
 PORT = '/dev/ttyUSB0'
 LOG_5MIN = os.path.join(LOG_DIR, 'data_5min.csv')
@@ -31,13 +34,16 @@ CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
 app = FastAPI()
 modbus_lock = threading.Lock()
 
+# 오프라인 모드용 Static 파일 라우팅
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 # --- 동적(Dynamic) 설정 ---
 DEFAULT_CONFIG = {
     "relay_id": 8,
     "ao_id": 9,
     "sensors": {
-        "s_1": {"id": 15, "type": "mlss", "enabled": True, "label": "MLSS", "color": "#94a3b8", "min": 0, "max": 10000},
-        "s_2": {"id": 16, "type": "uv254", "enabled": True, "label": "UV254 (COD)", "color": "#3b82f6", "min": 0, "max": 100}
+        "s_1": {"id": 15, "type": "mlss", "enabled": True, "label": "MLSS", "color": "#94a3b8", "min": 0, "max": 10000, "a": 1.0, "b": 0.0},
+        "s_2": {"id": 16, "type": "uv254", "enabled": True, "label": "UV254 (COD)", "color": "#3b82f6", "min": 0, "max": 100, "a": 1.0, "b": 0.0}
     }
 }
 
@@ -50,6 +56,8 @@ def load_config():
                 for k, v in cfg.get("sensors", {}).items():
                     if "min" not in v: v["min"] = 0
                     if "max" not in v: v["max"] = 100
+                    if "a" not in v: v["a"] = 1.0
+                    if "b" not in v: v["b"] = 0.0
                 return cfg
         except: return DEFAULT_CONFIG
     return DEFAULT_CONFIG
@@ -156,38 +164,30 @@ def modbus_worker():
                 try:
                     with modbus_lock:
                         instr = create_instrument(s_id)
-                        val_num = None
+                        raw_val = None
                         
                         if s_type == "mlss":
-                            v = read_with_retry(instr.read_float, 6, 3, 2)
-                            sensor_data[key]["val"] = f"{v:.2f}"
-                            val_num = v
-                            
+                            raw_val = read_with_retry(instr.read_float, 6, 3, 2)
                         elif s_type == "uv254":
                             read_with_retry(instr.read_register, 12288, 0, 3)
                             t_r = read_with_retry(instr.read_registers, 9728, 2, 3)
                             c_r = read_with_retry(instr.read_registers, 9730, 2, 3)
                             tr_r = read_with_retry(instr.read_registers, 4608, 2, 3)
-                            c_val = decode_dcba(c_r)
-                            sensor_data[key]["val"] = f"{c_val:.2f}"
+                            raw_val = decode_dcba(c_r)
                             sensor_data[key]["temp"] = f"{decode_dcba(t_r):.1f}"
                             sensor_data[key]["turb"] = f"{decode_dcba(tr_r):.2f}"
-                            val_num = c_val
+                        elif s_type in ["orp", "oil", "do"]:
+                            read_with_retry(instr.read_register, 12288, 0, 3)
+                            raw_val = decode_dcba(read_with_retry(instr.read_registers, 9730, 2, 3))
+                        
+                        val_num = None
+                        if raw_val is not None:
+                            a_val = float(s.get("a", 1.0))
+                            b_val = float(s.get("b", 0.0))
+                            val_num = (raw_val * a_val) + b_val
                             
-                        # 기존 + 추가된 센서들 (Turbidity, Conductivity)
-                        elif s_type in ["orp", "oil", "do", "turbidity", "conductivity"]:
-                            read_with_retry(instr.read_register, 12288, 0, 3)
-                            val = decode_dcba(read_with_retry(instr.read_registers, 9730, 2, 3))
                             fmt = "{:.1f}" if s_type == "orp" else "{:.2f}"
-                            sensor_data[key]["val"] = fmt.format(val)
-                            val_num = val
-
-                        # pH 센서 전용 로직 (0x2800 주소 사용)
-                        elif s_type == "ph":
-                            read_with_retry(instr.read_register, 12288, 0, 3)
-                            val = decode_dcba(read_with_retry(instr.read_registers, 10240, 2, 3))
-                            sensor_data[key]["val"] = f"{val:.2f}"
-                            val_num = val
+                            sensor_data[key]["val"] = fmt.format(val_num)
                         
                         min_v = float(s.get("min", 0))
                         max_v = float(s.get("max", 100))
@@ -206,7 +206,7 @@ def modbus_worker():
                         
                         if max_v <= min_v: ao_val = 4.0
                         else:
-                            c_val = max(min_v, min(val_num if val_num else min_v, max_v))
+                            c_val = max(min_v, min(val_num if val_num is not None else min_v, max_v))
                             ao_val = 4.0 + ((c_val - min_v) / (max_v - min_v)) * 16.0
                         
                         sensor_data[key]["ao"] = f"{ao_val:.2f}"
@@ -377,11 +377,11 @@ def get_gui():
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
         <title>Smart Farm Pro</title>
-        <script src="https://cdn.tailwindcss.com"></script>
+        <script src="/static/tailwind.js"></script>
         <script>
             tailwind.config = { darkMode: 'class' }
         </script>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script src="/static/chart.js"></script>
         <style>
             body { font-family: 'Inter', sans-serif; overflow: hidden; -webkit-font-smoothing: antialiased; transition: background-color 0.3s, color 0.3s; }
             .nav-btn.active { border-bottom: 2px solid #0891b2; color: #0891b2; }
@@ -419,6 +419,17 @@ def get_gui():
             
             .log-tab-btn.active { background-color: #0891b2; color: white; border-color: #0891b2; }
             .dark .log-tab-btn.active { background-color: #06b6d4; color: white; border-color: #06b6d4; }
+
+            input[type="number"]::-webkit-outer-spin-button,
+            input[type="number"]::-webkit-inner-spin-button {
+                -webkit-appearance: none;
+                margin: 0;
+            }
+            input[type="number"] {
+                -moz-appearance: textfield;
+            }
+            
+            .no-select { user-select: none; -webkit-user-select: none; }
         </style>
         <script>
             window.isAppDark = true;
@@ -519,7 +530,10 @@ def get_gui():
             
             <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-6 flex flex-col gap-4 w-2/3 min-h-0">
                 <div class="flex justify-between items-end border-b border-slate-300 dark:border-slate-700 pb-3 shrink-0">
-                    <h2 class="text-cyan-600 dark:text-cyan-400 font-black text-base uppercase">Device Network Manager</h2>
+                    <h2 class="text-cyan-600 dark:text-cyan-400 font-black text-base uppercase flex items-center gap-3">
+                        Device Network Manager
+                        <button onclick="toggleAdmin()" id="btn-admin-lock" class="bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-500 dark:text-slate-400 px-3 py-1.5 rounded text-sm transition-colors shadow-sm border border-slate-300 dark:border-slate-700 no-select" title="Unlock Admin Settings">🔒</button>
+                    </h2>
                     <button onclick="openModal()" class="bg-emerald-600 text-white px-4 py-2 rounded text-sm font-bold hover:bg-emerald-500">+ ADD SENSOR</button>
                 </div>
                 <div id="eng-sensors" class="grid grid-cols-2 gap-4 mt-2 overflow-y-auto pr-2 flex-grow min-h-0 content-start"></div>
@@ -532,11 +546,19 @@ def get_gui():
                     <div class="flex flex-col gap-3">
                         <div class="flex justify-between items-center bg-slate-100 dark:bg-slate-800/40 p-3 rounded-lg border border-slate-300 dark:border-slate-700/50">
                             <span class="text-sm font-bold text-slate-700 dark:text-slate-300 uppercase">Relay (KM6073)</span>
-                            <input id="eng-relay-id" type="number" class="bg-white dark:bg-black border border-slate-300 dark:border-slate-600 w-20 text-center rounded p-1.5 text-slate-900 dark:text-white font-bold text-base outline-none focus:border-cyan-500 dark:focus:border-cyan-400">
+                            <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                                <button onclick="stepVal('eng-relay-id', -1)" class="w-8 py-1.5 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
+                                <input id="eng-relay-id" type="number" class="bg-white dark:bg-black w-14 text-center py-1 text-slate-900 dark:text-white font-black text-lg outline-none">
+                                <button onclick="stepVal('eng-relay-id', 1)" class="w-8 py-1.5 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                            </div>
                         </div>
                         <div class="flex justify-between items-center bg-slate-100 dark:bg-slate-800/40 p-3 rounded-lg border border-slate-300 dark:border-slate-700/50">
                             <span class="text-sm font-bold text-slate-700 dark:text-slate-300 uppercase">Analog (KM6023)</span>
-                            <input id="eng-ao-id" type="number" class="bg-white dark:bg-black border border-slate-300 dark:border-slate-600 w-20 text-center rounded p-1.5 text-slate-900 dark:text-white font-bold text-base outline-none focus:border-cyan-500 dark:focus:border-cyan-400">
+                            <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                                <button onclick="stepVal('eng-ao-id', -1)" class="w-8 py-1.5 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
+                                <input id="eng-ao-id" type="number" class="bg-white dark:bg-black w-14 text-center py-1 text-slate-900 dark:text-white font-black text-lg outline-none">
+                                <button onclick="stepVal('eng-ao-id', 1)" class="w-8 py-1.5 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -544,12 +566,33 @@ def get_gui():
                 <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-6 flex flex-col gap-4 flex-grow min-h-0">
                     <div class="border-b border-slate-300 dark:border-slate-700 pb-3 flex justify-between items-end shrink-0">
                         <h2 class="text-emerald-600 dark:text-emerald-500 font-black text-base uppercase">4-20mA Scaling</h2>
-                        <span class="text-xs text-slate-500 font-bold">Min / Max</span>
                     </div>
                     <div id="eng-ao-scaling" class="overflow-y-auto pr-2 flex-grow min-h-0 content-start flex flex-col gap-3"></div>
                 </div>
             </div>
         </main>
+
+        <div id="admin-modal-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
+            <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[350px] p-6 shadow-2xl flex flex-col">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-amber-600 dark:text-amber-500 font-black text-xl uppercase tracking-wider flex items-center gap-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" /></svg>
+                        Admin Login
+                    </h2>
+                </div>
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">PASSWORD</label>
+                        <input type="password" id="admin-pwd-input" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-white text-base focus:outline-none focus:border-amber-500 dark:focus:border-amber-400" placeholder="Enter password..." onkeypress="if(event.key === 'Enter') verifyAdmin()">
+                        <p id="admin-error" class="text-xs text-rose-500 font-bold mt-2 hidden">Incorrect password!</p>
+                    </div>
+                </div>
+                <div class="flex justify-end gap-3 mt-6">
+                    <button onclick="closeAdminModal()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 dark:hover:bg-slate-600 border border-slate-300 dark:border-slate-600">CANCEL</button>
+                    <button onclick="verifyAdmin()" class="px-5 py-2 bg-amber-600 rounded text-sm font-bold text-white hover:bg-amber-500 border border-amber-700">UNLOCK</button>
+                </div>
+            </div>
+        </div>
 
         <div id="modal-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
             <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[450px] p-6 shadow-2xl max-h-[90vh] overflow-y-auto flex flex-col">
@@ -563,14 +606,15 @@ def get_gui():
                             <option value="do">DO (Dissolved Oxygen)</option>
                             <option value="orp">ORP</option>
                             <option value="oil">OIL IN WATER</option>
-                            <option value="ph">pH</option>
-                            <option value="turbidity">TURBIDITY</option>
-                            <option value="conductivity">CONDUCTIVITY</option>
                         </select>
                     </div>
                     <div>
                         <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">MODBUS ID (1-247)</label>
-                        <input type="number" id="new-id" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-white text-base focus:outline-none focus:border-cyan-500 dark:focus:border-cyan-400">
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
+                            <button onclick="stepVal('new-id', -1)" class="w-12 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
+                            <input type="number" id="new-id" class="w-full bg-slate-50 dark:bg-slate-800 text-center p-2.5 text-slate-900 dark:text-white font-black text-lg focus:outline-none focus:border-cyan-500 dark:focus:border-cyan-400">
+                            <button onclick="stepVal('new-id', 1)" class="w-12 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                        </div>
                     </div>
                     <div>
                         <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">DISPLAY LABEL</label>
@@ -600,18 +644,26 @@ def get_gui():
                 
                 <div class="space-y-4">
                     <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700">
-                        <label class="block text-[11px] font-black text-slate-500 dark:text-slate-400 mb-1 uppercase tracking-widest">K Value (Span / 2-Point)</label>
-                        <input type="number" step="0.0001" id="cal-k" class="w-full bg-transparent border-b border-slate-300 dark:border-slate-600 p-1 text-slate-900 dark:text-white text-lg font-mono font-bold focus:outline-none focus:border-indigo-500 text-right" placeholder="Reading...">
+                        <label class="block text-xs font-black text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-widest">K Value (Span / 2-Point)</label>
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                            <button onclick="stepVal('cal-k', -0.01)" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
+                            <input type="number" step="0.0001" id="cal-k" class="w-full bg-white dark:bg-black text-center py-2.5 text-slate-900 dark:text-white text-lg font-mono font-bold focus:outline-none focus:border-indigo-500" placeholder="Reading...">
+                            <button onclick="stepVal('cal-k', 0.01)" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                        </div>
                     </div>
                     <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700">
-                        <label class="block text-[11px] font-black text-slate-500 dark:text-slate-400 mb-1 uppercase tracking-widest">B Value (Zero / 1-Point)</label>
-                        <input type="number" step="0.0001" id="cal-b" class="w-full bg-transparent border-b border-slate-300 dark:border-slate-600 p-1 text-slate-900 dark:text-white text-lg font-mono font-bold focus:outline-none focus:border-indigo-500 text-right" placeholder="Reading...">
+                        <label class="block text-xs font-black text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-widest">B Value (Zero / 1-Point)</label>
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                            <button onclick="stepVal('cal-b', -0.1)" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
+                            <input type="number" step="0.0001" id="cal-b" class="w-full bg-white dark:bg-black text-center py-2.5 text-slate-900 dark:text-white text-lg font-mono font-bold focus:outline-none focus:border-indigo-500" placeholder="Reading...">
+                            <button onclick="stepVal('cal-b', 0.1)" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                        </div>
                     </div>
                 </div>
                 
                 <div class="flex justify-end gap-3 mt-6">
-                    <button onclick="closeCalModal()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 dark:hover:bg-slate-600 border border-slate-300 dark:border-slate-600">CANCEL</button>
-                    <button id="cal-save-btn" onclick="saveCalibration()" class="px-5 py-2 bg-indigo-600 rounded text-sm font-bold text-white hover:bg-indigo-500 border border-indigo-700 transition-colors shadow-lg">SAVE TO SENSOR</button>
+                    <button onclick="closeCalModal()" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 dark:hover:bg-slate-600 border border-slate-300 dark:border-slate-600">CANCEL</button>
+                    <button id="cal-save-btn" onclick="saveCalibration()" class="px-5 py-2.5 bg-indigo-600 rounded text-sm font-bold text-white hover:bg-indigo-500 border border-indigo-700 transition-colors shadow-lg">SAVE TO SENSOR</button>
                 </div>
             </div>
         </div>
@@ -623,11 +675,52 @@ def get_gui():
             let configData = null;
             let isInitialized = false;
             let charts = [];
-            // 추가된 센서들의 단위(Unit)를 등록해 줍니다.
-            const unitMap = { 
-                "mlss": "mg/L", "uv254": "mg/L", "do": "mg/L", "orp": "mV", "oil": "ug/L",
-                "ph": "pH", "turbidity": "NTU", "conductivity": "mS/cm"
-            };
+            const unitMap = { "mlss": "mg/L", "uv254": "mg/L", "do": "mg/L", "orp": "mV", "oil": "ug/L" };
+
+            // === Touch-friendly step function ===
+            function stepVal(id, step) {
+                const el = document.getElementById(id);
+                if(!el) return;
+                let val = parseFloat(el.value);
+                if(isNaN(val)) val = 0;
+                val += step;
+                val = Math.round(val * 10000) / 10000;
+                el.value = val;
+            }
+
+            // === Custom Admin Login Logic ===
+            let isAdmin = false;
+            
+            function toggleAdmin() {
+                if(!isAdmin) {
+                    document.getElementById('admin-error').classList.add('hidden');
+                    document.getElementById('admin-pwd-input').value = '';
+                    document.getElementById('admin-modal-overlay').classList.remove('hidden');
+                    setTimeout(() => document.getElementById('admin-pwd-input').focus(), 100);
+                } else {
+                    isAdmin = false;
+                    document.getElementById('btn-admin-lock').innerText = '🔒';
+                    document.getElementById('btn-admin-lock').classList.remove('bg-amber-100', 'text-amber-700', 'dark:bg-amber-900/50', 'dark:text-amber-400');
+                    document.querySelectorAll('.admin-only').forEach(el => el.classList.add('hidden'));
+                }
+            }
+
+            function closeAdminModal() {
+                document.getElementById('admin-modal-overlay').classList.add('hidden');
+            }
+
+            function verifyAdmin() {
+                const pwd = document.getElementById('admin-pwd-input').value;
+                if(pwd === "1234") {
+                    isAdmin = true;
+                    document.getElementById('btn-admin-lock').innerText = '🔓 ADMIN';
+                    document.getElementById('btn-admin-lock').classList.add('bg-amber-100', 'text-amber-700', 'dark:bg-amber-900/50', 'dark:text-amber-400');
+                    document.querySelectorAll('.admin-only').forEach(el => el.classList.remove('hidden'));
+                    closeAdminModal();
+                } else {
+                    document.getElementById('admin-error').classList.remove('hidden');
+                }
+            }
 
             const iconSun = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v2.25m6.364.386l-1.591 1.591M21 12h-2.25m-.386 6.364l-1.591-1.591M12 18.75V21m-4.773-4.227l-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z" /></svg>`;
             const iconMoon = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M21.752 15.002A9.718 9.718 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 009.002-5.998z" /></svg>`;
@@ -731,7 +824,7 @@ def get_gui():
                 const label = document.getElementById('new-label').value || type.toUpperCase();
                 const color = document.getElementById('new-color').value;
                 const newKey = 's_' + Date.now();
-                configData.sensors[newKey] = { id: id, type: type, enabled: true, label: label, color: color, min: 0, max: 100 };
+                configData.sensors[newKey] = { id: id, type: type, enabled: true, label: label, color: color, min: 0, max: 100, a: 1.0, b: 0.0 };
                 saveEngineering(true);
             }
 
@@ -745,7 +838,7 @@ def get_gui():
             async function openCalModal(id, type, label) {
                 document.getElementById('cal-sensor-id').value = id;
                 document.getElementById('cal-sensor-type').value = type;
-                document.getElementById('cal-modal-title').innerText = label + " CALIBRATION";
+                document.getElementById('cal-modal-title').innerText = label + " HW CALIBRATION";
                 document.getElementById('cal-k').value = '';
                 document.getElementById('cal-b').value = '';
                 document.getElementById('cal-k').placeholder = 'Reading...';
@@ -937,9 +1030,12 @@ def get_gui():
                 
                 let engHTML = '';
                 let aoHTML = '';
+                
+                const adminHidden = isAdmin ? "" : "hidden";
+
                 for(const [key, s] of Object.entries(configData.sensors)) {
                     engHTML += `
-                    <div class="flex flex-col bg-slate-100 dark:bg-slate-800/40 p-4 rounded-lg border border-slate-300 dark:border-slate-700/50 h-[100px] shrink-0">
+                    <div class="bg-slate-100 dark:bg-slate-800/40 p-4 rounded-lg border border-slate-300 dark:border-slate-700/50 h-auto">
                         <div class="flex justify-between items-center border-b border-slate-300 dark:border-slate-700/50 pb-3 mb-3">
                             <div class="flex items-center gap-4">
                                 <label class="relative inline-flex items-center cursor-pointer">
@@ -951,11 +1047,34 @@ def get_gui():
                             <button onclick="deleteSensor('${key}')" class="text-rose-500 hover:text-rose-600 dark:hover:text-rose-400"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5 h-5"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" /></svg></button>
                         </div>
                         <div class="flex justify-between items-center">
-                            <span class="text-xs text-slate-500 font-bold">TYPE: ${s.type.toUpperCase()}</span>
-                            <div class="flex items-center">
-                                <span class="text-xs text-slate-500 mr-2">ID:</span>
-                                <input id="id-${key}" type="number" value="${s.id}" class="bg-white dark:bg-black border border-slate-300 dark:border-slate-600 w-12 text-center rounded p-1 text-slate-800 dark:text-white font-bold text-sm outline-none focus:border-cyan-500 dark:focus:border-cyan-400">
-                                <button onclick="openCalModal(${s.id}, '${s.type}', '${s.label}')" class="bg-indigo-100 text-indigo-600 hover:bg-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-400 dark:hover:bg-indigo-800/60 px-2 py-1 rounded text-[10px] font-black uppercase tracking-wider ml-2 border border-indigo-200 dark:border-indigo-800 transition-colors">⚙️ CAL</button>
+                            <span class="text-sm text-slate-500 font-bold tracking-wide">TYPE: ${s.type.toUpperCase()}</span>
+                            <div class="flex items-center gap-1">
+                                <span class="text-sm text-slate-500 font-bold mr-1">ID:</span>
+                                <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                                    <button onclick="stepVal('id-${key}', -1)" class="w-8 py-1 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
+                                    <input id="id-${key}" type="number" value="${s.id}" class="bg-white dark:bg-black w-10 text-center py-1 text-slate-800 dark:text-white font-black text-base outline-none">
+                                    <button onclick="stepVal('id-${key}', 1)" class="w-8 py-1 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                                </div>
+                                <button onclick="openCalModal(${s.id}, '${s.type}', '${s.label}')" class="admin-only ${adminHidden} bg-indigo-100 text-indigo-600 hover:bg-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-400 dark:hover:bg-indigo-800/60 px-3 py-1.5 rounded text-xs font-black uppercase tracking-wider border border-indigo-200 dark:border-indigo-800 transition-colors shadow-sm ml-2">HW CAL</button>
+                            </div>
+                        </div>
+                        
+                        <div class="admin-only ${adminHidden} mt-4 pt-4 border-t border-slate-300 dark:border-slate-700/50 flex gap-4">
+                            <div class="flex-1 flex flex-col gap-2">
+                                <span class="text-xs text-slate-500 font-bold tracking-widest uppercase">A (Slope) =</span>
+                                <div class="flex items-center bg-white dark:bg-black border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                                    <button onclick="stepVal('a-${key}', -0.01)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">-</button>
+                                    <input id="a-${key}" type="number" step="0.0001" value="${s.a !== undefined ? s.a : 1.0}" class="w-full text-center bg-transparent text-slate-800 dark:text-white font-black text-sm outline-none focus:text-indigo-500">
+                                    <button onclick="stepVal('a-${key}', 0.01)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">+</button>
+                                </div>
+                            </div>
+                            <div class="flex-1 flex flex-col gap-2">
+                                <span class="text-xs text-slate-500 font-bold tracking-widest uppercase">B (Offset) =</span>
+                                <div class="flex items-center bg-white dark:bg-black border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                                    <button onclick="stepVal('b-${key}', -0.1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">-</button>
+                                    <input id="b-${key}" type="number" step="0.0001" value="${s.b !== undefined ? s.b : 0.0}" class="w-full text-center bg-transparent text-slate-800 dark:text-white font-black text-sm outline-none focus:text-indigo-500">
+                                    <button onclick="stepVal('b-${key}', 0.1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">+</button>
+                                </div>
                             </div>
                         </div>
                     </div>`;
@@ -963,15 +1082,23 @@ def get_gui():
                     if(s.enabled) {
                         aoHTML += `
                         <div class="bg-slate-100 dark:bg-slate-800/30 p-4 rounded-lg border border-slate-300 dark:border-slate-700/50 shrink-0">
-                            <div class="text-sm font-bold truncate mb-2.5" style="color: ${s.color}">${s.label}</div>
-                            <div class="flex gap-3">
-                                <div class="flex-1 flex items-center bg-white dark:bg-black border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5">
-                                    <span class="text-xs text-slate-500 w-9">4mA:</span>
-                                    <input id="min-${key}" type="number" value="${s.min}" class="bg-transparent w-full text-right text-slate-800 dark:text-white font-bold text-sm outline-none">
+                            <div class="text-sm font-bold truncate mb-3" style="color: ${s.color}">${s.label}</div>
+                            <div class="flex gap-4">
+                                <div class="flex-1 flex flex-col gap-2">
+                                    <span class="text-xs text-slate-500 font-bold tracking-widest uppercase">4mA Limit</span>
+                                    <div class="flex items-center bg-white dark:bg-black border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                                        <button onclick="stepVal('min-${key}', -1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">-</button>
+                                        <input id="min-${key}" type="number" value="${s.min}" class="w-full text-center bg-transparent text-slate-800 dark:text-white font-black text-base outline-none">
+                                        <button onclick="stepVal('min-${key}', 1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">+</button>
+                                    </div>
                                 </div>
-                                <div class="flex-1 flex items-center bg-white dark:bg-black border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5">
-                                    <span class="text-xs text-slate-500 w-10">20mA:</span>
-                                    <input id="max-${key}" type="number" value="${s.max}" class="bg-transparent w-full text-right text-slate-800 dark:text-white font-bold text-sm outline-none">
+                                <div class="flex-1 flex flex-col gap-2">
+                                    <span class="text-xs text-slate-500 font-bold tracking-widest uppercase">20mA Limit</span>
+                                    <div class="flex items-center bg-white dark:bg-black border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                                        <button onclick="stepVal('max-${key}', -1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">-</button>
+                                        <input id="max-${key}" type="number" value="${s.max}" class="w-full text-center bg-transparent text-slate-800 dark:text-white font-black text-base outline-none">
+                                        <button onclick="stepVal('max-${key}', 1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">+</button>
+                                    </div>
                                 </div>
                             </div>
                         </div>`;
@@ -1096,6 +1223,13 @@ def get_gui():
                         const maxIn = document.getElementById('max-' + key);
                         if(minIn) configData.sensors[key].min = parseFloat(minIn.value);
                         if(maxIn) configData.sensors[key].max = parseFloat(maxIn.value);
+                        
+                        if(isAdmin) {
+                            const aIn = document.getElementById('a-' + key);
+                            const bIn = document.getElementById('b-' + key);
+                            if(aIn) configData.sensors[key].a = parseFloat(aIn.value);
+                            if(bIn) configData.sensors[key].b = parseFloat(bIn.value);
+                        }
                     }
                 }
                 
