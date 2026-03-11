@@ -14,14 +14,13 @@ import math
 from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles # <-- Добавлено для Offline режима
+from fastapi.staticfiles import StaticFiles
 
-# === 시스템 절대 경로 고정 (바탕화면 실행 및 Kiosk 모드 방어) ===
+# === 시스템 절대 경로 고정 ===
 BASE_DIR = '/home/young/farm'
 LOG_DIR = os.path.join(BASE_DIR, 'logs')
-STATIC_DIR = os.path.join(BASE_DIR, 'static') # <-- Папка для локальных стилей
+STATIC_DIR = os.path.join(BASE_DIR, 'static')
 
-# 폴더가 없으면 자동 생성
 os.makedirs(LOG_DIR, exist_ok=True) 
 os.makedirs(STATIC_DIR, exist_ok=True)
 
@@ -34,7 +33,6 @@ CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
 app = FastAPI()
 modbus_lock = threading.Lock()
 
-# 오프라인 모드용 Static 파일 라우팅
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # --- 동적(Dynamic) 설정 ---
@@ -42,8 +40,8 @@ DEFAULT_CONFIG = {
     "relay_id": 8,
     "ao_id": 9,
     "sensors": {
-        "s_1": {"id": 15, "type": "mlss", "enabled": True, "label": "MLSS", "color": "#94a3b8", "min": 0, "max": 10000, "a": 1.0, "b": 0.0},
-        "s_2": {"id": 16, "type": "uv254", "enabled": True, "label": "UV254 (COD)", "color": "#3b82f6", "min": 0, "max": 100, "a": 1.0, "b": 0.0}
+        "s_1": {"id": 15, "type": "mlss", "enabled": True, "label": "MLSS", "color": "#94a3b8", "min": 0, "max": 10000, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel": 0},
+        "s_2": {"id": 16, "type": "uv254", "enabled": True, "label": "UV254 (COD)", "color": "#3b82f6", "min": 0, "max": 100, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel": 0}
     }
 }
 
@@ -58,6 +56,10 @@ def load_config():
                     if "max" not in v: v["max"] = 100
                     if "a" not in v: v["a"] = 1.0
                     if "b" not in v: v["b"] = 0.0
+                    if "c_mode" not in v: v["c_mode"] = "off"
+                    if "c_int" not in v: v["c_int"] = 30
+                    if "c_dur" not in v: v["c_dur"] = 10
+                    if "c_rel" not in v: v["c_rel"] = 0
                 return cfg
         except: return DEFAULT_CONFIG
     return DEFAULT_CONFIG
@@ -75,12 +77,17 @@ relay_states = [0, 0, 0, 0]
 hourly_buffer = {}
 alarm_states = {}
 
+clean_last_run = {}
+clean_relay_off = {}
+
 def init_data_structures():
-    global sensor_data, history_data, hourly_buffer, alarm_states
+    global sensor_data, history_data, hourly_buffer, alarm_states, clean_last_run, clean_relay_off
     sensor_data = {"status": "Online"}
     history_data = {}
     hourly_buffer = {}
     alarm_states = {}
+    clean_last_run = {}
+    clean_relay_off = {}
     
     for key, s in config.get("sensors", {}).items():
         if s["type"] == "uv254":
@@ -93,7 +100,6 @@ def init_data_structures():
 
 init_data_structures()
 
-# --- Modbus Float Helper ---
 def decode_dcba(registers):
     packed = struct.pack('>HH', registers[0], registers[1])
     return struct.unpack('<f', packed)[0]
@@ -110,18 +116,24 @@ def encode_abcd(val):
     packed = struct.pack('>f', float(val))
     return struct.unpack('>HH', packed)
 
+_shared_instr = None
+
 def create_instrument(sensor_id):
-    instr = minimalmodbus.Instrument(PORT, int(sensor_id))
-    instr.serial.baudrate = 9600
-    instr.serial.timeout = 0.5
-    instr.clear_buffers_before_each_transaction = True 
-    return instr
+    global _shared_instr
+    if _shared_instr is None:
+        _shared_instr = minimalmodbus.Instrument(PORT, int(sensor_id))
+        _shared_instr.serial.baudrate = 9600
+        _shared_instr.serial.timeout = 0.7  
+        _shared_instr.clear_buffers_before_each_transaction = True
+    else:
+        _shared_instr.address = int(sensor_id)
+    return _shared_instr
 
 def read_with_retry(func, *args, retries=2):
     for attempt in range(retries):
         try: return func(*args)
         except:
-            time.sleep(0.1)
+            time.sleep(0.2) 
             if attempt == retries - 1: raise
 
 def write_csv_log(filepath, headers, row):
@@ -133,7 +145,69 @@ def write_csv_log(filepath, headers, row):
             writer.writerow(row)
     except: pass
 
-# --- 메인 Modbus 루프 ---
+def trigger_cleaning(key, force_mode=None, force_dur=None, force_rel=None):
+    global clean_relay_off
+    s = config.get("sensors", {}).get(key)
+    if not s: return {"status": "error", "message": "Sensor not found"}
+    
+    c_mode = force_mode if force_mode else s.get("c_mode", "off")
+    if c_mode == "off": return {"status": "ok"}
+    
+    try:
+        if c_mode == "internal":
+            with modbus_lock:
+                instr = create_instrument(s["id"])
+                try:
+                    read_with_retry(instr.write_register, 12544, 1, 0, 6, retries=2)
+                except:
+                    read_with_retry(instr.write_registers, 12544, [1], retries=2)
+        
+        elif c_mode == "external":
+            c_rel = force_rel if force_rel is not None else int(s.get("c_rel", 0))
+            c_dur = force_dur if force_dur is not None else int(s.get("c_dur", 10))
+            with modbus_lock:
+                instr = create_instrument(int(config.get("relay_id", 8)))
+                read_with_retry(instr.write_bit, c_rel, 1, 5, retries=2)
+                
+            clean_relay_off[c_rel] = time.time() + c_dur
+            relay_states[c_rel] = 1 
+            
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def cleaning_worker():
+    global clean_last_run, clean_relay_off
+    while True:
+        now = time.time()
+        
+        for key, s in config.get("sensors", {}).items():
+            if not s.get("enabled", False): continue
+            c_mode = s.get("c_mode", "off")
+            if c_mode == "off": continue
+            
+            c_int_sec = int(s.get("c_int", 30)) * 60
+            if c_int_sec <= 0: continue
+            
+            if key not in clean_last_run:
+                clean_last_run[key] = now 
+                
+            if now - clean_last_run[key] >= c_int_sec:
+                trigger_cleaning(key)
+                clean_last_run[key] = now
+                
+        for ch, off_time in list(clean_relay_off.items()):
+            if now >= off_time:
+                try:
+                    with modbus_lock:
+                        instr = create_instrument(int(config.get("relay_id", 8)))
+                        read_with_retry(instr.write_bit, int(ch), 0, 5, retries=2)
+                    relay_states[int(ch)] = 0
+                    del clean_relay_off[ch]
+                except: pass
+                
+        time.sleep(1)
+
 def modbus_worker():
     global sensor_data, history_data, hourly_buffer, alarm_states
     
@@ -142,7 +216,8 @@ def modbus_worker():
     
     while True:
         now = datetime.now()
-        active_keys = [k for k, v in config.get("sensors", {}).items() if v.get("enabled")]
+        all_keys = list(config.get("sensors", {}).keys())
+        active_keys = [k for k in all_keys if config["sensors"][k].get("enabled")]
         
         try:
             sensors_cfg = list(config.get("sensors", {}).items())
@@ -238,17 +313,17 @@ def modbus_worker():
                     if len(history_data[key]) > 0: history_data[key].pop(0)
                     history_data[key].append(None)
 
-            if active_keys:
+            if all_keys:
                 if now.minute % 5 == 0 and now.minute != last_5min_minute:
-                    headers = ["Time"] + [config["sensors"][k]["label"] for k in active_keys]
-                    row = [now.strftime("%Y-%m-%d %H:%M:00")] + [sensor_data.get(k, {}).get("val", "--") for k in active_keys]
+                    headers = ["Time"] + [config["sensors"][k]["label"] for k in all_keys]
+                    row = [now.strftime("%Y-%m-%d %H:%M:00")] + [sensor_data.get(k, {}).get("val", "--") for k in all_keys]
                     write_csv_log(LOG_5MIN, headers, row)
                     last_5min_minute = now.minute
 
                 if now.minute == 0 and now.hour != last_1hr_hour:
-                    headers = ["Time"] + [config["sensors"][k]["label"] + " (AVG)" for k in active_keys]
+                    headers = ["Time"] + [config["sensors"][k]["label"] + " (AVG)" for k in all_keys]
                     row = [now.strftime("%Y-%m-%d %H:00:00")]
-                    for k in active_keys:
+                    for k in all_keys:
                         vals = [v for v in hourly_buffer.get(k, []) if v is not None]
                         if vals: row.append(f"{(sum(vals)/len(vals)):.2f}")
                         else: row.append("--")
@@ -260,7 +335,6 @@ def modbus_worker():
         except Exception: pass
         time.sleep(0.5)
 
-# --- API ---
 def read_tail(filepath, lines=30):
     if not os.path.exists(filepath): return {"headers": [], "rows": []}
     try:
@@ -283,9 +357,21 @@ def get_all():
 @app.post("/api/save_config")
 async def update_cfg(request: Request):
     global config
-    config = await request.json()
+    new_config = await request.json()
+    
+    old_keys = set(config.get("sensors", {}).keys())
+    new_keys = set(new_config.get("sensors", {}).keys())
+    
+    config = new_config
     save_config(config)
-    init_data_structures()
+    
+    if old_keys != new_keys:
+        init_data_structures()
+        try:
+            if os.path.exists(LOG_5MIN): os.remove(LOG_5MIN)
+            if os.path.exists(LOG_1HR): os.remove(LOG_1HR)
+        except: pass
+        
     return {"status": "ok"}
 
 @app.get("/api/relay")
@@ -293,40 +379,100 @@ def toggle_relay(ch: int, state: int):
     relay_states[ch] = state
     try:
         with modbus_lock:
-            instr = create_instrument(config.get("relay_id", 8))
-            instr.write_bit(ch, state, 5)
+            instr = create_instrument(int(config.get("relay_id", 8)))
+            read_with_retry(instr.write_bit, ch, state, 5, retries=2)
     except: pass
     return {"status": "ok"}
 
-@app.get("/api/export_to_desktop")
-def export_to_desktop(type: str):
+@app.get("/api/trigger_clean")
+def trigger_clean_api(key: str, mode: str = None, dur: int = 10, rel: int = 0):
+    return trigger_cleaning(key, force_mode=mode, force_dur=dur, force_rel=rel)
+
+# ==========================================
+# ADVANCED EXPORT ENGINE (Патч 8.0)
+# ==========================================
+@app.get("/api/export_options")
+def get_export_options(type: str):
     file_map = {"5min": LOG_5MIN, "1hr": LOG_1HR, "alarm": LOG_ALARM}
     target_file = file_map.get(type)
     
     if not target_file or not os.path.exists(target_file):
-        return {"status": "error", "message": "No data"}
+        return {"status": "error", "message": "No data available"}
+    
+    try:
+        with open(target_file, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            headers = next(reader, [])
+            dates = set()
+            for row in reader:
+                if row and len(row) > 0:
+                    # '2026-03-11 15:30:00' 에서 '2026-03-11' 날짜만 추출
+                    date_part = row[0].split(' ')[0]
+                    dates.add(date_part)
+        
+        return {
+            "status": "ok", 
+            "columns": headers, 
+            "dates": sorted(list(dates), reverse=True) # 최신 날짜가 위로 오게
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/export_execute")
+async def export_execute(request: Request):
+    payload = await request.json()
+    log_type = payload.get("type", "5min")
+    sel_cols = payload.get("columns", [])
+    sel_dates = payload.get("dates", [])
+    
+    file_map = {"5min": LOG_5MIN, "1hr": LOG_1HR, "alarm": LOG_ALARM}
+    target_file = file_map.get(log_type)
+    
+    if not target_file or not os.path.exists(target_file):
+        return {"status": "error"}
         
     try:
         desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-        if not os.path.exists(desktop_path):
+        if not os.path.exists(desktop_path): 
             desktop_path = os.path.expanduser("~") 
             
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        export_name = f"Export_{type}_{timestamp}.csv"
+        export_name = f"Export_{log_type}_{timestamp}.csv"
         destination = os.path.join(desktop_path, export_name)
         
-        shutil.copy2(target_file, destination)
+        with open(target_file, 'r', encoding='utf-8') as fin, open(destination, 'w', newline='', encoding='utf-8') as fout:
+            reader = csv.reader(fin)
+            writer = csv.writer(fout)
+            
+            headers = next(reader, [])
+            
+            # 사용자가 선택한 컬럼의 인덱스 추출 (항상 Time은 포함)
+            col_indices = [i for i, h in enumerate(headers) if h in sel_cols]
+            if 0 not in col_indices and "Time" in headers:
+                col_indices.insert(0, headers.index("Time"))
+                
+            if not col_indices:
+                return {"status": "error", "message": "No columns selected"}
+            
+            # 필터링된 헤더 쓰기
+            writer.writerow([headers[i] for i in col_indices])
+            
+            # 필터링된 행(데이터) 쓰기
+            for row in reader:
+                if not row: continue
+                date_part = row[0].split(' ')[0]
+                if date_part in sel_dates:
+                    writer.writerow([row[i] for i in col_indices if i < len(row)])
+                    
         return {"status": "ok", "path": destination}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# === 하드웨어 교정(Calibration) API ===
 @app.get("/api/get_cal")
 def get_cal(sensor_id: int, s_type: str):
     try:
         with modbus_lock:
             instr = create_instrument(sensor_id)
-            instr.serial.timeout = 1.0
             
             if s_type == "mlss":
                 k_val = 1.0
@@ -348,7 +494,6 @@ def set_cal(sensor_id: int, s_type: str, k: float, b: float):
     try:
         with modbus_lock:
             instr = create_instrument(sensor_id)
-            instr.serial.timeout = 1.0
             
             if s_type == "mlss":
                 read_with_retry(instr.write_float, 18, float(b), 2, 0, retries=2)
@@ -367,7 +512,6 @@ def exit_app():
     os.kill(os.getpid(), signal.SIGINT)
     return {"status": "ok"}
 
-# --- HTML/JS Frontend ---
 @app.get("/", response_class=HTMLResponse)
 def get_gui():
     return """
@@ -421,14 +565,8 @@ def get_gui():
             .dark .log-tab-btn.active { background-color: #06b6d4; color: white; border-color: #06b6d4; }
 
             input[type="number"]::-webkit-outer-spin-button,
-            input[type="number"]::-webkit-inner-spin-button {
-                -webkit-appearance: none;
-                margin: 0;
-            }
-            input[type="number"] {
-                -moz-appearance: textfield;
-            }
-            
+            input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+            input[type="number"] { -moz-appearance: textfield; }
             .no-select { user-select: none; -webkit-user-select: none; }
         </style>
         <script>
@@ -448,7 +586,9 @@ def get_gui():
             <button onclick="showTab('trends')" id="btn-trends" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400">Trends</button>
             <button onclick="showTab('logs')" id="btn-logs" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400">Logs</button>
             <button onclick="showTab('ctrl')" id="btn-ctrl" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400">Control</button>
-            <button onclick="showTab('eng')" id="btn-eng" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400">Setup</button>
+            
+            <button onclick="requestAdminTab('eng')" id="btn-eng" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400">Setup</button>
+            
             <div class="flex-grow"></div>
             
             <button onclick="toggleTheme()" id="btn-theme" class="text-slate-600 dark:text-amber-400 text-sm font-bold bg-slate-200 dark:bg-slate-800/80 px-4 py-1.5 rounded hover:bg-slate-300 dark:hover:bg-slate-700 transition-colors flex items-center gap-2 mr-4 border border-slate-300 dark:border-slate-700">
@@ -493,7 +633,7 @@ def get_gui():
                     <button onclick="setLogView('1hr')" id="btn-v-1hr" class="log-tab-btn px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400">1-Hour AVG</button>
                     <button onclick="setLogView('alarm')" id="btn-v-alarm" class="log-tab-btn px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400">Alarm History</button>
                 </div>
-                <button id="btn-export" onclick="exportToDesktop()" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-6 py-2 rounded uppercase tracking-wider shadow-lg flex items-center gap-2 transition-colors border border-emerald-700">
+                <button id="btn-export" onclick="openExportModal()" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-6 py-2 rounded uppercase tracking-wider shadow-lg flex items-center gap-2 transition-colors border border-emerald-700">
                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" /></svg>
                     Export to Desktop
                 </button>
@@ -527,42 +667,29 @@ def get_gui():
         </main>
 
         <main id="tab-eng" class="p-6 hidden flex-grow flex gap-6 overflow-hidden min-h-0">
-            
             <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-6 flex flex-col gap-4 w-2/3 min-h-0">
                 <div class="flex justify-between items-end border-b border-slate-300 dark:border-slate-700 pb-3 shrink-0">
-                    <h2 class="text-cyan-600 dark:text-cyan-400 font-black text-base uppercase flex items-center gap-3">
-                        Device Network Manager
-                        <button onclick="toggleAdmin()" id="btn-admin-lock" class="bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-500 dark:text-slate-400 px-3 py-1.5 rounded text-sm transition-colors shadow-sm border border-slate-300 dark:border-slate-700 no-select" title="Unlock Admin Settings">🔒</button>
-                    </h2>
-                    <button onclick="openModal()" class="bg-emerald-600 text-white px-4 py-2 rounded text-sm font-bold hover:bg-emerald-500">+ ADD SENSOR</button>
+                    <div class="flex items-center gap-4">
+                        <h2 class="text-cyan-600 dark:text-cyan-400 font-black text-base uppercase flex items-center gap-3">
+                            Device Network Manager
+                            <button onclick="lockAdmin()" class="flex items-center bg-rose-100 text-rose-600 hover:bg-rose-200 dark:bg-rose-900/30 dark:text-rose-400 px-3 py-1.5 rounded text-xs font-black tracking-wider transition-colors shadow-sm border border-rose-200 dark:border-rose-800 no-select" title="Lock Admin Settings">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" class="w-4 h-4 mr-1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" /></svg>
+                                LOCK
+                            </button>
+                        </h2>
+                    </div>
+                    <div class="flex gap-2">
+                        <button onclick="openIoModal()" class="flex items-center gap-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 px-4 py-2 rounded text-sm font-bold hover:bg-slate-300 dark:hover:bg-slate-600 border border-slate-300 dark:border-slate-600 transition-colors">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M8.25 3v1.5M4.5 8.25H3m18 0h-1.5M4.5 12H3m18 0h-1.5m-15 3.75H3m18 0h-1.5M8.25 19.5V21M12 3v1.5m0 15V21m3.75-18v1.5m0 15V21m-9-1.5h10.5a2.25 2.25 0 002.25-2.25V6.75a2.25 2.25 0 00-2.25-2.25H6.75A2.25 2.25 0 004.5 6.75v10.5a2.25 2.25 0 002.25 2.25z" /></svg>
+                            I/O SETUP
+                        </button>
+                        <button onclick="openModal()" class="bg-emerald-600 text-white px-4 py-2 rounded text-sm font-bold hover:bg-emerald-500 transition-colors">+ ADD SENSOR</button>
+                    </div>
                 </div>
                 <div id="eng-sensors" class="grid grid-cols-2 gap-4 mt-2 overflow-y-auto pr-2 flex-grow min-h-0 content-start"></div>
-                <button id="save-btn" onclick="saveEngineering()" class="mt-2 bg-cyan-600 p-4 rounded text-base text-white font-black hover:bg-cyan-500 transition-all shrink-0 border border-cyan-700">SAVE & APPLY ALL SETTINGS</button>
             </div>
             
             <div class="flex flex-col gap-6 w-1/3 min-h-0">
-                <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-6 flex flex-col gap-4 shrink-0">
-                    <div class="border-b border-slate-300 dark:border-slate-700 pb-3 shrink-0"><h2 class="text-amber-600 dark:text-amber-500 font-black text-base uppercase">Hardware IDs</h2></div>
-                    <div class="flex flex-col gap-3">
-                        <div class="flex justify-between items-center bg-slate-100 dark:bg-slate-800/40 p-3 rounded-lg border border-slate-300 dark:border-slate-700/50">
-                            <span class="text-sm font-bold text-slate-700 dark:text-slate-300 uppercase">Relay (KM6073)</span>
-                            <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                                <button onclick="stepVal('eng-relay-id', -1)" class="w-8 py-1.5 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
-                                <input id="eng-relay-id" type="number" class="bg-white dark:bg-black w-14 text-center py-1 text-slate-900 dark:text-white font-black text-lg outline-none">
-                                <button onclick="stepVal('eng-relay-id', 1)" class="w-8 py-1.5 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
-                            </div>
-                        </div>
-                        <div class="flex justify-between items-center bg-slate-100 dark:bg-slate-800/40 p-3 rounded-lg border border-slate-300 dark:border-slate-700/50">
-                            <span class="text-sm font-bold text-slate-700 dark:text-slate-300 uppercase">Analog (KM6023)</span>
-                            <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                                <button onclick="stepVal('eng-ao-id', -1)" class="w-8 py-1.5 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
-                                <input id="eng-ao-id" type="number" class="bg-white dark:bg-black w-14 text-center py-1 text-slate-900 dark:text-white font-black text-lg outline-none">
-                                <button onclick="stepVal('eng-ao-id', 1)" class="w-8 py-1.5 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                
                 <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-6 flex flex-col gap-4 flex-grow min-h-0">
                     <div class="border-b border-slate-300 dark:border-slate-700 pb-3 flex justify-between items-end shrink-0">
                         <h2 class="text-emerald-600 dark:text-emerald-500 font-black text-base uppercase">4-20mA Scaling</h2>
@@ -572,23 +699,75 @@ def get_gui():
             </div>
         </main>
 
+        <div id="export-modal-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
+            <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[600px] p-6 shadow-2xl flex flex-col max-h-[90vh]">
+                <h2 class="text-emerald-600 dark:text-emerald-500 font-black text-xl mb-4 shrink-0 uppercase border-b border-slate-200 dark:border-slate-800 pb-3">Advanced Data Export</h2>
+                
+                <div class="flex gap-6 flex-grow min-h-0 overflow-hidden">
+                    <div class="w-1/2 flex flex-col min-h-0">
+                        <h3 class="text-xs font-black text-slate-500 uppercase tracking-widest mb-2 shrink-0">1. Select Dates</h3>
+                        <div id="export-dates-container" class="flex-grow overflow-y-auto border border-slate-200 dark:border-slate-700 rounded bg-slate-50 dark:bg-slate-800/50 p-2 space-y-1">
+                            </div>
+                    </div>
+                    
+                    <div class="w-1/2 flex flex-col min-h-0">
+                        <h3 class="text-xs font-black text-slate-500 uppercase tracking-widest mb-2 shrink-0">2. Select Sensors</h3>
+                        <div id="export-cols-container" class="flex-grow overflow-y-auto border border-slate-200 dark:border-slate-700 rounded bg-slate-50 dark:bg-slate-800/50 p-2 space-y-1">
+                            </div>
+                    </div>
+                </div>
+                
+                <div class="flex justify-end gap-3 mt-6 shrink-0">
+                    <button onclick="closeExportModal()" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600">CANCEL</button>
+                    <button id="btn-execute-export" onclick="executeAdvancedExport()" class="px-5 py-2.5 bg-emerald-600 rounded text-sm font-bold text-white hover:bg-emerald-500 border border-emerald-700 shadow-lg">DOWNLOAD CSV</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="io-modal-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
+            <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[400px] p-6 shadow-2xl flex flex-col">
+                <h2 class="text-slate-700 dark:text-slate-300 font-black text-xl mb-4 shrink-0 uppercase border-b border-slate-200 dark:border-slate-800 pb-3">I/O Modules Setup</h2>
+                <div class="flex flex-col gap-4">
+                    <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700">
+                        <label class="block text-xs font-black text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-widest">Relay Module (KM6073) ID</label>
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                            <button onclick="stepVal('eng-relay-id', -1)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
+                            <input onchange="triggerSave()" type="number" id="eng-relay-id" class="w-full bg-white dark:bg-black text-center py-2 text-slate-900 dark:text-white text-lg font-bold focus:outline-none focus:border-cyan-500">
+                            <button onclick="stepVal('eng-relay-id', 1)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                        </div>
+                    </div>
+                    <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700">
+                        <label class="block text-xs font-black text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-widest">Analog Output (KM6023) ID</label>
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                            <button onclick="stepVal('eng-ao-id', -1)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
+                            <input onchange="triggerSave()" type="number" id="eng-ao-id" class="w-full bg-white dark:bg-black text-center py-2 text-slate-900 dark:text-white text-lg font-bold focus:outline-none focus:border-cyan-500">
+                            <button onclick="stepVal('eng-ao-id', 1)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="flex justify-end gap-3 mt-6">
+                    <button onclick="closeIoModal()" class="px-6 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm">CLOSE</button>
+                </div>
+            </div>
+        </div>
+
         <div id="admin-modal-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
             <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[350px] p-6 shadow-2xl flex flex-col">
                 <div class="flex justify-between items-center mb-4">
                     <h2 class="text-amber-600 dark:text-amber-500 font-black text-xl uppercase tracking-wider flex items-center gap-2">
-                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" /></svg>
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" class="w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" /></svg>
                         Admin Login
                     </h2>
                 </div>
                 <div class="space-y-4">
                     <div>
                         <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">PASSWORD</label>
-                        <input type="password" id="admin-pwd-input" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-white text-base focus:outline-none focus:border-amber-500 dark:focus:border-amber-400" placeholder="Enter password..." onkeypress="if(event.key === 'Enter') verifyAdmin()">
+                        <input type="password" id="admin-pwd-input" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-white text-base focus:outline-none focus:border-amber-500" placeholder="Enter password..." onkeypress="if(event.key === 'Enter') verifyAdmin()">
                         <p id="admin-error" class="text-xs text-rose-500 font-bold mt-2 hidden">Incorrect password!</p>
                     </div>
                 </div>
                 <div class="flex justify-end gap-3 mt-6">
-                    <button onclick="closeAdminModal()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 dark:hover:bg-slate-600 border border-slate-300 dark:border-slate-600">CANCEL</button>
+                    <button onclick="closeAdminModal()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600">CANCEL</button>
                     <button onclick="verifyAdmin()" class="px-5 py-2 bg-amber-600 rounded text-sm font-bold text-white hover:bg-amber-500 border border-amber-700">UNLOCK</button>
                 </div>
             </div>
@@ -600,7 +779,7 @@ def get_gui():
                 <div class="space-y-4 flex-grow min-h-0">
                     <div>
                         <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">SENSOR TYPE</label>
-                        <select id="new-type" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-black dark:text-black text-base focus:outline-none focus:border-cyan-500 dark:focus:border-cyan-400">
+                        <select id="new-type" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-black dark:text-black text-base focus:outline-none focus:border-cyan-500">
                             <option value="mlss">MLSS (Suspended Solids)</option>
                             <option value="uv254">UV254 (COD/BOD)</option>
                             <option value="do">DO (Dissolved Oxygen)</option>
@@ -611,14 +790,14 @@ def get_gui():
                     <div>
                         <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">MODBUS ID (1-247)</label>
                         <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
-                            <button onclick="stepVal('new-id', -1)" class="w-12 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
-                            <input type="number" id="new-id" class="w-full bg-slate-50 dark:bg-slate-800 text-center p-2.5 text-slate-900 dark:text-white font-black text-lg focus:outline-none focus:border-cyan-500 dark:focus:border-cyan-400">
-                            <button onclick="stepVal('new-id', 1)" class="w-12 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                            <button onclick="stepVal('new-id', -1)" class="w-12 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
+                            <input type="number" id="new-id" class="w-full bg-slate-50 dark:bg-slate-800 text-center p-2.5 text-slate-900 dark:text-white font-black text-lg outline-none">
+                            <button onclick="stepVal('new-id', 1)" class="w-12 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
                         </div>
                     </div>
                     <div>
                         <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">DISPLAY LABEL</label>
-                        <input type="text" id="new-label" placeholder="e.g. DO 3 (Tank 2)" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-white text-base focus:outline-none focus:border-cyan-500 dark:focus:border-cyan-400">
+                        <input type="text" id="new-label" placeholder="e.g. DO 3 (Tank 2)" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-white text-base focus:outline-none focus:border-cyan-500">
                     </div>
                     <div>
                         <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">CHART COLOR</label>
@@ -626,44 +805,131 @@ def get_gui():
                     </div>
                 </div>
                 <div class="flex justify-end gap-3 mt-6 shrink-0">
-                    <button onclick="closeModal()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 dark:hover:bg-slate-600 border border-slate-300 dark:border-slate-600">CANCEL</button>
+                    <button onclick="closeModal()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600">CANCEL</button>
                     <button onclick="confirmAddSensor()" class="px-5 py-2 bg-emerald-600 rounded text-sm font-bold text-white hover:bg-emerald-500 border border-emerald-700">ADD DEVICE</button>
                 </div>
             </div>
         </div>
 
         <div id="cal-modal-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
-            <div class="bg-white dark:bg-slate-900 border-t-4 border-t-indigo-500 border border-slate-300 dark:border-slate-700 rounded-xl w-[400px] p-6 shadow-2xl flex flex-col">
-                <div class="flex justify-between items-center mb-2">
+            <div class="bg-white dark:bg-slate-900 border-t-4 border-t-indigo-500 border border-slate-300 dark:border-slate-700 rounded-xl w-[450px] p-6 shadow-2xl flex flex-col max-h-[90vh] overflow-y-auto">
+                <div class="flex justify-between items-center mb-4">
                     <h2 id="cal-modal-title" class="text-indigo-600 dark:text-indigo-400 font-black text-xl uppercase tracking-wider">CALIBRATION</h2>
                 </div>
-                <p class="text-xs font-bold text-rose-500 mb-5 uppercase tracking-wide">⚠️ Writes directly to sensor memory</p>
                 
+                <input type="hidden" id="cal-sensor-key">
                 <input type="hidden" id="cal-sensor-id">
                 <input type="hidden" id="cal-sensor-type">
                 
-                <div class="space-y-4">
-                    <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700">
-                        <label class="block text-xs font-black text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-widest">K Value (Span / 2-Point)</label>
-                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                            <button onclick="stepVal('cal-k', -0.01)" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
-                            <input type="number" step="0.0001" id="cal-k" class="w-full bg-white dark:bg-black text-center py-2.5 text-slate-900 dark:text-white text-lg font-mono font-bold focus:outline-none focus:border-indigo-500" placeholder="Reading...">
-                            <button onclick="stepVal('cal-k', 0.01)" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                <div class="mb-6">
+                    <h3 class="text-sm font-bold text-slate-800 dark:text-slate-200 uppercase mb-3 border-b border-slate-200 dark:border-slate-700 pb-1">1. HMI Software (y = A*x + B)</h3>
+                    <p class="text-xs text-slate-500 mb-3">Adjusts the displayed value on the screen.</p>
+                    <div class="space-y-3">
+                        <div class="flex items-center gap-3">
+                            <span class="w-20 text-xs font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest text-right">A (Slope)</span>
+                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
+                                <button onclick="stepVal('cal-soft-a', -0.01)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
+                                <input type="number" step="0.0001" id="cal-soft-a" onchange="triggerSave()" class="w-full bg-white dark:bg-black text-center py-1.5 text-slate-900 dark:text-white text-base font-mono font-bold outline-none">
+                                <button onclick="stepVal('cal-soft-a', 0.01)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <span class="w-20 text-xs font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest text-right">B (Offset)</span>
+                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
+                                <button onclick="stepVal('cal-soft-b', -0.1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
+                                <input type="number" step="0.0001" id="cal-soft-b" onchange="triggerSave()" class="w-full bg-white dark:bg-black text-center py-1.5 text-slate-900 dark:text-white text-base font-mono font-bold outline-none">
+                                <button onclick="stepVal('cal-soft-b', 0.1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                            </div>
                         </div>
                     </div>
-                    <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700">
-                        <label class="block text-xs font-black text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-widest">B Value (Zero / 1-Point)</label>
-                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                            <button onclick="stepVal('cal-b', -0.1)" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
-                            <input type="number" step="0.0001" id="cal-b" class="w-full bg-white dark:bg-black text-center py-2.5 text-slate-900 dark:text-white text-lg font-mono font-bold focus:outline-none focus:border-indigo-500" placeholder="Reading...">
-                            <button onclick="stepVal('cal-b', 0.1)" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                </div>
+
+                <div>
+                    <h3 class="text-sm font-bold text-rose-600 dark:text-rose-400 uppercase mb-3 border-b border-rose-200 dark:border-rose-900/50 pb-1">2. Sensor Hardware (Modbus)</h3>
+                    <p class="text-xs text-rose-500 mb-3 font-bold flex items-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" class="w-4 h-4 mr-1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+                        Writes directly to physical sensor memory.
+                    </p>
+                    <div class="space-y-3">
+                        <div class="flex items-center gap-3">
+                            <span class="w-20 text-xs font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest text-right">K (Span)</span>
+                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
+                                <button onclick="stepVal('cal-hw-k', -0.01)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
+                                <input type="number" step="0.0001" id="cal-hw-k" class="w-full bg-slate-50 dark:bg-slate-800 text-center py-1.5 text-slate-900 dark:text-white text-base font-mono font-bold outline-none" placeholder="Reading...">
+                                <button onclick="stepVal('cal-hw-k', 0.01)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <span class="w-20 text-xs font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest text-right">B (Zero)</span>
+                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
+                                <button onclick="stepVal('cal-hw-b', -0.1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
+                                <input type="number" step="0.0001" id="cal-hw-b" class="w-full bg-slate-50 dark:bg-slate-800 text-center py-1.5 text-slate-900 dark:text-white text-base font-mono font-bold outline-none" placeholder="Reading...">
+                                <button onclick="stepVal('cal-hw-b', 0.1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                            </div>
                         </div>
                     </div>
                 </div>
                 
-                <div class="flex justify-end gap-3 mt-6">
-                    <button onclick="closeCalModal()" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 dark:hover:bg-slate-600 border border-slate-300 dark:border-slate-600">CANCEL</button>
-                    <button id="cal-save-btn" onclick="saveCalibration()" class="px-5 py-2.5 bg-indigo-600 rounded text-sm font-bold text-white hover:bg-indigo-500 border border-indigo-700 transition-colors shadow-lg">SAVE TO SENSOR</button>
+                <div class="flex justify-end gap-3 mt-8">
+                    <button onclick="closeCalModal()" class="px-6 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm">CLOSE</button>
+                    <button id="cal-save-btn" onclick="saveCalibration()" class="px-5 py-2.5 bg-indigo-600 rounded text-sm font-bold text-white hover:bg-indigo-500 border border-indigo-700 shadow-lg">SAVE HW CAL</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="clean-modal-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
+            <div class="bg-white dark:bg-slate-900 border-t-4 border-t-sky-500 border border-slate-300 dark:border-slate-700 rounded-xl w-[400px] p-6 shadow-2xl flex flex-col">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 id="clean-modal-title" class="text-sky-600 dark:text-sky-400 font-black text-xl uppercase tracking-wider">CLEANING SETUP</h2>
+                </div>
+                
+                <input type="hidden" id="clean-sensor-key">
+                
+                <div class="space-y-5">
+                    <div>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest">Control Mode</label>
+                        <select id="clean-mode" onchange="updateCleanUI(); triggerSave();" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-black font-bold text-sm focus:outline-none focus:border-sky-500">
+                            <option value="off">OFF (No Cleaning)</option>
+                            <option value="internal">INTERNAL (Sensor Wiper)</option>
+                            <option value="external">EXTERNAL (KM6073 Relay)</option>
+                        </select>
+                    </div>
+                    
+                    <div id="clean-int-block" class="hidden">
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest">Interval (Minutes)</label>
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
+                            <button onclick="stepVal('clean-int', -5)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
+                            <input onchange="triggerSave()" type="number" id="clean-int" class="w-full bg-slate-50 dark:bg-slate-800 text-center py-2 text-slate-900 dark:text-white font-black text-base outline-none">
+                            <button onclick="stepVal('clean-int', 5)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                        </div>
+                    </div>
+
+                    <div id="clean-dur-block" class="hidden">
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest">Duration (Seconds)</label>
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
+                            <button onclick="stepVal('clean-dur', -1)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
+                            <input onchange="triggerSave()" type="number" id="clean-dur" class="w-full bg-slate-50 dark:bg-slate-800 text-center py-2 text-slate-900 dark:text-white font-black text-base outline-none">
+                            <button onclick="stepVal('clean-dur', 1)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                        </div>
+                    </div>
+
+                    <div id="clean-rel-block" class="hidden">
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest">KM6073 Relay Channel</label>
+                        <select id="clean-rel" onchange="triggerSave()" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-black font-bold text-sm focus:outline-none focus:border-sky-500">
+                            <option value="0">CH 0 (Pump 1)</option>
+                            <option value="1">CH 1 (Pump 2)</option>
+                            <option value="2">CH 2 (Aerator)</option>
+                            <option value="3">CH 3 (Drain Valve)</option>
+                        </select>
+                    </div>
+                </div>
+                
+                <div class="flex justify-between items-center mt-8 pt-4 border-t border-slate-200 dark:border-slate-700">
+                    <button id="btn-test-clean" onclick="testCleaning()" class="flex items-center px-4 py-2 bg-slate-100 dark:bg-slate-800 text-slate-500 font-bold rounded text-xs border border-slate-300 dark:border-slate-600 hover:bg-slate-200 transition-colors shadow-sm">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" class="w-3.5 h-3.5 mr-1.5"><path d="M8 5v14l11-7z"/></svg>
+                        TEST NOW
+                    </button>
+                    <button onclick="closeCleanModal()" class="px-6 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm">CLOSE</button>
                 </div>
             </div>
         </div>
@@ -677,7 +943,59 @@ def get_gui():
             let charts = [];
             const unitMap = { "mlss": "mg/L", "uv254": "mg/L", "do": "mg/L", "orp": "mV", "oil": "ug/L" };
 
-            // === Touch-friendly step function ===
+            async function triggerSave() {
+                if(!configData) return;
+                
+                const relayEl = document.getElementById('eng-relay-id');
+                if(relayEl) configData.relay_id = parseInt(relayEl.value);
+                const aoEl = document.getElementById('eng-ao-id');
+                if(aoEl) configData.ao_id = parseInt(aoEl.value);
+                
+                for(const key of Object.keys(configData.sensors)) {
+                    const idEl = document.getElementById('id-' + key);
+                    if(idEl) configData.sensors[key].id = parseInt(idEl.value);
+                    
+                    const enEl = document.getElementById('en-' + key);
+                    if(enEl) configData.sensors[key].enabled = enEl.checked;
+                    
+                    const lblEl = document.getElementById('label-' + key);
+                    if(lblEl) {
+                        configData.sensors[key].label = lblEl.value;
+                        const dashLbl = document.querySelector(`#card-${key} .absolute`);
+                        if(dashLbl) dashLbl.innerText = lblEl.value.toUpperCase();
+                    }
+                    
+                    const minIn = document.getElementById('min-' + key);
+                    const maxIn = document.getElementById('max-' + key);
+                    if(minIn) configData.sensors[key].min = parseFloat(minIn.value);
+                    if(maxIn) configData.sensors[key].max = parseFloat(maxIn.value);
+
+                    if(document.getElementById('clean-sensor-key') && document.getElementById('clean-sensor-key').value === key && !document.getElementById('clean-modal-overlay').classList.contains('hidden')) {
+                        configData.sensors[key].c_mode = document.getElementById('clean-mode').value;
+                        configData.sensors[key].c_int = parseInt(document.getElementById('clean-int').value);
+                        configData.sensors[key].c_dur = parseInt(document.getElementById('clean-dur').value);
+                        configData.sensors[key].c_rel = parseInt(document.getElementById('clean-rel').value);
+                    }
+
+                    if(document.getElementById('cal-sensor-key') && document.getElementById('cal-sensor-key').value === key && !document.getElementById('cal-modal-overlay').classList.contains('hidden')) {
+                        configData.sensors[key].a = parseFloat(document.getElementById('cal-soft-a').value);
+                        configData.sensors[key].b = parseFloat(document.getElementById('cal-soft-b').value);
+                    }
+                }
+                
+                await fetch('/api/save_config', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(configData)
+                });
+            }
+
+            function toggleSensorEnabled(key, isChecked) {
+                configData.sensors[key].enabled = isChecked;
+                triggerSave().then(() => {
+                    initDynamicUI();
+                });
+            }
+
             function stepVal(id, step) {
                 const el = document.getElementById(id);
                 if(!el) return;
@@ -686,41 +1004,56 @@ def get_gui():
                 val += step;
                 val = Math.round(val * 10000) / 10000;
                 el.value = val;
+                
+                if(id.startsWith('id-') || id.startsWith('min-') || id.startsWith('max-') || id === 'eng-relay-id' || id === 'eng-ao-id' || id.startsWith('clean-') || id.startsWith('cal-soft-')) {
+                    triggerSave();
+                }
             }
 
-            // === Custom Admin Login Logic ===
             let isAdmin = false;
-            
-            function toggleAdmin() {
-                if(!isAdmin) {
+            let pendingTab = null;
+
+            function requestAdminTab(tab) {
+                if (isAdmin) {
+                    showTab(tab);
+                } else {
+                    pendingTab = tab;
                     document.getElementById('admin-error').classList.add('hidden');
                     document.getElementById('admin-pwd-input').value = '';
                     document.getElementById('admin-modal-overlay').classList.remove('hidden');
                     setTimeout(() => document.getElementById('admin-pwd-input').focus(), 100);
-                } else {
-                    isAdmin = false;
-                    document.getElementById('btn-admin-lock').innerText = '🔒';
-                    document.getElementById('btn-admin-lock').classList.remove('bg-amber-100', 'text-amber-700', 'dark:bg-amber-900/50', 'dark:text-amber-400');
-                    document.querySelectorAll('.admin-only').forEach(el => el.classList.add('hidden'));
                 }
-            }
-
-            function closeAdminModal() {
-                document.getElementById('admin-modal-overlay').classList.add('hidden');
             }
 
             function verifyAdmin() {
                 const pwd = document.getElementById('admin-pwd-input').value;
                 if(pwd === "1234") {
                     isAdmin = true;
-                    document.getElementById('btn-admin-lock').innerText = '🔓 ADMIN';
-                    document.getElementById('btn-admin-lock').classList.add('bg-amber-100', 'text-amber-700', 'dark:bg-amber-900/50', 'dark:text-amber-400');
-                    document.querySelectorAll('.admin-only').forEach(el => el.classList.remove('hidden'));
                     closeAdminModal();
+                    document.getElementById('btn-eng').classList.add('text-amber-500'); 
+                    if (pendingTab) {
+                        showTab(pendingTab);
+                        pendingTab = null;
+                    }
                 } else {
                     document.getElementById('admin-error').classList.remove('hidden');
                 }
             }
+
+            function lockAdmin() {
+                isAdmin = false;
+                document.getElementById('btn-eng').classList.remove('text-amber-500');
+                showTab('dash');
+            }
+
+            function closeAdminModal() { document.getElementById('admin-modal-overlay').classList.add('hidden'); }
+
+            function openIoModal() {
+                document.getElementById('eng-relay-id').value = configData.relay_id;
+                document.getElementById('eng-ao-id').value = configData.ao_id;
+                document.getElementById('io-modal-overlay').classList.remove('hidden');
+            }
+            function closeIoModal() { document.getElementById('io-modal-overlay').classList.add('hidden'); }
 
             const iconSun = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v2.25m6.364.386l-1.591 1.591M21 12h-2.25m-.386 6.364l-1.591-1.591M12 18.75V21m-4.773-4.227l-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z" /></svg>`;
             const iconMoon = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M21.752 15.002A9.718 9.718 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 009.002-5.998z" /></svg>`;
@@ -782,31 +1115,92 @@ def get_gui():
                 update();
             }
 
-            async function exportToDesktop() {
+            // === ADVANCED EXPORT ENGINE ===
+            async function openExportModal() {
                 const btn = document.getElementById('btn-export');
                 const origHTML = btn.innerHTML;
-                const origClasses = btn.className;
-
+                btn.innerHTML = "⏳ LOADING...";
+                
                 try {
-                    const res = await fetch('/api/export_to_desktop?type=' + currentLogView);
+                    const res = await fetch('/api/export_options?type=' + currentLogView);
                     const data = await res.json();
+                    
+                    if (data.status !== 'ok' || data.dates.length === 0) {
+                        alert("No data available to export yet.");
+                        btn.innerHTML = origHTML;
+                        return;
+                    }
+                    
+                    let datesHtml = '';
+                    data.dates.forEach(d => {
+                        datesHtml += `
+                        <label class="flex items-center gap-3 p-2 hover:bg-slate-200 dark:hover:bg-slate-700 rounded cursor-pointer transition-colors">
+                            <input type="checkbox" class="export-date-cb w-4 h-4 text-emerald-600 rounded border-gray-300 focus:ring-emerald-500" value="${d}" checked>
+                            <span class="text-sm font-bold text-slate-700 dark:text-slate-300">${d}</span>
+                        </label>`;
+                    });
+                    document.getElementById('export-dates-container').innerHTML = datesHtml;
+                    
+                    let colsHtml = '';
+                    data.columns.forEach(c => {
+                        // "Time" 컬럼은 무조건 포함되므로 리스트에서 제외하거나 수정 불가로 만듦
+                        if(c === 'Time') return; 
+                        colsHtml += `
+                        <label class="flex items-center gap-3 p-2 hover:bg-slate-200 dark:hover:bg-slate-700 rounded cursor-pointer transition-colors">
+                            <input type="checkbox" class="export-col-cb w-4 h-4 text-emerald-600 rounded border-gray-300 focus:ring-emerald-500" value="${c}" checked>
+                            <span class="text-sm font-bold text-slate-700 dark:text-slate-300">${c}</span>
+                        </label>`;
+                    });
+                    document.getElementById('export-cols-container').innerHTML = colsHtml;
+                    
+                    document.getElementById('export-modal-overlay').classList.remove('hidden');
+                } catch (e) {
+                    alert("Error loading export options.");
+                }
+                
+                btn.innerHTML = origHTML;
+            }
 
+            function closeExportModal() { document.getElementById('export-modal-overlay').classList.add('hidden'); }
+
+            async function executeAdvancedExport() {
+                const dateCbs = document.querySelectorAll('.export-date-cb:checked');
+                const colCbs = document.querySelectorAll('.export-col-cb:checked');
+                
+                const selectedDates = Array.from(dateCbs).map(cb => cb.value);
+                const selectedCols = Array.from(colCbs).map(cb => cb.value);
+                
+                if (selectedDates.length === 0 || selectedCols.length === 0) {
+                    alert("Please select at least one date and one sensor.");
+                    return;
+                }
+                
+                const btn = document.getElementById('btn-execute-export');
+                const origText = btn.innerText;
+                btn.innerText = "⏳ SAVING...";
+                
+                try {
+                    const res = await fetch('/api/export_execute', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ type: currentLogView, dates: selectedDates, columns: selectedCols })
+                    });
+                    const data = await res.json();
+                    
                     if (data.status === 'ok') {
-                        btn.innerHTML = '✅ SAVED TO DESKTOP';
-                        btn.className = 'bg-emerald-500 text-white font-black text-xs px-6 py-2 rounded uppercase tracking-widest flex items-center gap-2 transition-colors border border-emerald-600';
+                        btn.innerText = "✅ SAVED TO DESKTOP";
+                        btn.classList.add('bg-cyan-600');
+                        setTimeout(() => { closeExportModal(); btn.innerText = origText; btn.classList.remove('bg-cyan-600'); }, 1500);
                     } else {
-                        btn.innerHTML = '❌ NO DATA YET';
-                        btn.className = 'bg-rose-500 text-white font-black text-xs px-6 py-2 rounded uppercase tracking-widest flex items-center gap-2 transition-colors border border-rose-600';
+                        btn.innerText = "❌ FAILED";
+                        btn.classList.add('bg-rose-600');
+                        setTimeout(() => { btn.innerText = origText; btn.classList.remove('bg-rose-600'); }, 2000);
                     }
                 } catch (e) {
-                    btn.innerHTML = '❌ ERROR';
-                    btn.className = 'bg-rose-500 text-white font-black text-xs px-6 py-2 rounded uppercase tracking-widest flex items-center gap-2 transition-colors border border-rose-600';
+                    btn.innerText = "❌ ERROR";
+                    btn.classList.add('bg-rose-600');
+                    setTimeout(() => { btn.innerText = origText; btn.classList.remove('bg-rose-600'); }, 2000);
                 }
-
-                setTimeout(() => {
-                    btn.innerHTML = origHTML;
-                    btn.className = origClasses;
-                }, 3000);
             }
 
             function openModal() { 
@@ -824,40 +1218,52 @@ def get_gui():
                 const label = document.getElementById('new-label').value || type.toUpperCase();
                 const color = document.getElementById('new-color').value;
                 const newKey = 's_' + Date.now();
-                configData.sensors[newKey] = { id: id, type: type, enabled: true, label: label, color: color, min: 0, max: 100, a: 1.0, b: 0.0 };
-                saveEngineering(true);
+                configData.sensors[newKey] = { id: id, type: type, enabled: true, label: label, color: color, min: 0, max: 100, a: 1.0, b: 0.0, c_mode: "off", c_int: 30, c_dur: 10, c_rel: 0 };
+                triggerSave().then(() => {
+                    initDynamicUI();
+                });
+                closeModal();
             }
 
             function deleteSensor(key) {
                 if(confirm('Are you sure you want to delete this sensor?')) {
                     delete configData.sensors[key];
-                    saveEngineering(true);
+                    triggerSave().then(() => {
+                        initDynamicUI();
+                    });
                 }
             }
 
-            async function openCalModal(id, type, label) {
+            async function openCalModal(key, id, type, label) {
+                document.getElementById('cal-sensor-key').value = key;
                 document.getElementById('cal-sensor-id').value = id;
                 document.getElementById('cal-sensor-type').value = type;
-                document.getElementById('cal-modal-title').innerText = label + " HW CALIBRATION";
-                document.getElementById('cal-k').value = '';
-                document.getElementById('cal-b').value = '';
-                document.getElementById('cal-k').placeholder = 'Reading...';
-                document.getElementById('cal-b').placeholder = 'Reading...';
+                document.getElementById('cal-modal-title').innerText = label + " CALIBRATION";
+                
+                const s = configData.sensors[key];
+                document.getElementById('cal-soft-a').value = s.a !== undefined ? s.a : 1.0;
+                document.getElementById('cal-soft-b').value = s.b !== undefined ? s.b : 0.0;
+
+                document.getElementById('cal-hw-k').value = '';
+                document.getElementById('cal-hw-b').value = '';
+                document.getElementById('cal-hw-k').placeholder = 'Reading...';
+                document.getElementById('cal-hw-b').placeholder = 'Reading...';
+                
                 document.getElementById('cal-modal-overlay').classList.remove('hidden');
 
                 try {
                     const res = await fetch(`/api/get_cal?sensor_id=${id}&s_type=${type}`);
                     const data = await res.json();
                     if (data.status === 'ok') {
-                        document.getElementById('cal-k').value = data.k;
-                        document.getElementById('cal-b').value = data.b;
+                        document.getElementById('cal-hw-k').value = data.k;
+                        document.getElementById('cal-hw-b').value = data.b;
                     } else {
-                        document.getElementById('cal-k').placeholder = 'Comm Error';
-                        document.getElementById('cal-b').placeholder = 'Comm Error';
+                        document.getElementById('cal-hw-k').placeholder = 'Error';
+                        document.getElementById('cal-hw-b').placeholder = 'Error';
                     }
                 } catch (e) {
-                    document.getElementById('cal-k').placeholder = 'Timeout';
-                    document.getElementById('cal-b').placeholder = 'Timeout';
+                    document.getElementById('cal-hw-k').placeholder = 'Timeout';
+                    document.getElementById('cal-hw-b').placeholder = 'Timeout';
                 }
             }
 
@@ -866,20 +1272,23 @@ def get_gui():
             async function saveCalibration() {
                 const id = document.getElementById('cal-sensor-id').value;
                 const type = document.getElementById('cal-sensor-type').value;
-                const k = parseFloat(document.getElementById('cal-k').value);
-                const b = parseFloat(document.getElementById('cal-b').value);
+                const hwK = parseFloat(document.getElementById('cal-hw-k').value);
+                const hwB = parseFloat(document.getElementById('cal-hw-b').value);
+                
                 const btn = document.getElementById('cal-save-btn');
 
-                if (isNaN(k) || isNaN(b)) {
-                    alert("Please enter valid numeric values for K and B.");
+                if (isNaN(hwK) || isNaN(hwB)) {
+                    alert("Please enter valid numeric values.");
                     return;
                 }
+
+                await triggerSave(); 
 
                 const origText = btn.innerText;
                 btn.innerText = "WRITING...";
 
                 try {
-                    const res = await fetch(`/api/set_cal?sensor_id=${id}&s_type=${type}&k=${k}&b=${b}`);
+                    const res = await fetch(`/api/set_cal?sensor_id=${id}&s_type=${type}&k=${hwK}&b=${hwB}`);
                     const data = await res.json();
                     if (data.status === 'ok') {
                         btn.innerText = "✅ SAVED";
@@ -892,15 +1301,89 @@ def get_gui():
                             btn.classList.replace('border-emerald-700', 'border-indigo-700');
                         }, 1200);
                     } else {
-                        btn.innerText = "❌ FAILED";
+                        btn.innerText = "❌ HW FAILED";
                         btn.classList.replace('bg-indigo-600', 'bg-rose-600');
                         setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-indigo-600'); }, 2000);
                     }
                 } catch(e) {
-                    btn.innerText = "❌ FAILED";
+                    btn.innerText = "❌ HW FAILED";
                     btn.classList.replace('bg-indigo-600', 'bg-rose-600');
                     setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-indigo-600'); }, 2000);
                 }
+            }
+
+            function openCleanModal(key, label) {
+                document.getElementById('clean-sensor-key').value = key;
+                document.getElementById('clean-modal-title').innerText = label + " CLEANING";
+                
+                const s = configData.sensors[key];
+                document.getElementById('clean-mode').value = s.c_mode || 'off';
+                document.getElementById('clean-int').value = s.c_int !== undefined ? s.c_int : 30;
+                document.getElementById('clean-dur').value = s.c_dur !== undefined ? s.c_dur : 10;
+                document.getElementById('clean-rel').value = s.c_rel !== undefined ? s.c_rel : 0;
+                
+                updateCleanUI();
+                document.getElementById('clean-modal-overlay').classList.remove('hidden');
+            }
+
+            function updateCleanUI() {
+                const mode = document.getElementById('clean-mode').value;
+                const intBlock = document.getElementById('clean-int-block');
+                const durBlock = document.getElementById('clean-dur-block');
+                const relBlock = document.getElementById('clean-rel-block');
+                
+                if (mode === 'off') {
+                    intBlock.classList.add('hidden');
+                    durBlock.classList.add('hidden');
+                    relBlock.classList.add('hidden');
+                } else if (mode === 'internal') {
+                    intBlock.classList.remove('hidden');
+                    durBlock.classList.add('hidden');
+                    relBlock.classList.add('hidden');
+                } else if (mode === 'external') {
+                    intBlock.classList.remove('hidden');
+                    durBlock.classList.remove('hidden');
+                    relBlock.classList.remove('hidden');
+                }
+            }
+
+            function closeCleanModal() { document.getElementById('clean-modal-overlay').classList.add('hidden'); }
+
+            async function testCleaning() {
+                const key = document.getElementById('clean-sensor-key').value;
+                const mode = document.getElementById('clean-mode').value;
+                const dur = parseInt(document.getElementById('clean-dur').value) || 10;
+                const rel = parseInt(document.getElementById('clean-rel').value) || 0;
+                
+                const btn = document.getElementById('btn-test-clean');
+                const origHTML = btn.innerHTML;
+                const origClasses = btn.className;
+                
+                btn.innerHTML = "⏳ RUNNING...";
+                btn.className = "flex items-center px-4 py-2 bg-sky-500 text-white font-bold rounded text-xs shadow transition-colors";
+
+                await triggerSave();
+
+                try {
+                    const res = await fetch(`/api/trigger_clean?key=${key}&mode=${mode}&dur=${dur}&rel=${rel}`);
+                    const data = await res.json();
+                    
+                    if (data.status === 'ok') {
+                        btn.innerHTML = "✅ TRIGGERED";
+                        btn.classList.replace('bg-sky-500', 'bg-emerald-500');
+                    } else {
+                        btn.innerHTML = "❌ FAILED";
+                        btn.classList.replace('bg-sky-500', 'bg-rose-500');
+                    }
+                } catch(e) {
+                    btn.innerHTML = "❌ ERROR";
+                    btn.classList.replace('bg-sky-500', 'bg-rose-500');
+                }
+                
+                setTimeout(() => { 
+                    btn.innerHTML = origHTML; 
+                    btn.className = origClasses; 
+                }, 2000);
             }
 
             function focusChart(mode) { setChartMode(mode); showTab('trends'); }
@@ -1025,24 +1508,19 @@ def get_gui():
                     charts = newCharts;
                 }, 100);
 
-                document.getElementById('eng-relay-id').value = configData.relay_id;
-                document.getElementById('eng-ao-id').value = configData.ao_id;
-                
                 let engHTML = '';
                 let aoHTML = '';
-                
-                const adminHidden = isAdmin ? "" : "hidden";
 
                 for(const [key, s] of Object.entries(configData.sensors)) {
                     engHTML += `
-                    <div class="bg-slate-100 dark:bg-slate-800/40 p-4 rounded-lg border border-slate-300 dark:border-slate-700/50 h-auto">
+                    <div class="bg-slate-100 dark:bg-slate-800/40 p-4 rounded-lg border border-slate-300 dark:border-slate-700/50 h-auto flex flex-col justify-between">
                         <div class="flex justify-between items-center border-b border-slate-300 dark:border-slate-700/50 pb-3 mb-3">
                             <div class="flex items-center gap-4">
                                 <label class="relative inline-flex items-center cursor-pointer">
-                                    <input type="checkbox" id="en-${key}" ${s.enabled ? 'checked' : ''} class="sr-only peer">
+                                    <input type="checkbox" id="en-${key}" onchange="toggleSensorEnabled('${key}', this.checked)" ${s.enabled ? 'checked' : ''} class="sr-only peer">
                                     <div class="w-12 h-6 bg-slate-300 dark:bg-slate-900 rounded-full border border-slate-400 dark:border-slate-600 peer-checked:bg-emerald-500 transition-colors after:absolute after:top-[1px] after:left-[2px] after:bg-white dark:after:bg-slate-400 after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-[24px] peer-checked:after:bg-white"></div>
                                 </label>
-                                <input id="label-${key}" type="text" value="${s.label}" class="editable-label text-sm font-black uppercase truncate w-28 px-1 text-slate-800 dark:text-white" style="color: ${s.color}">
+                                <input id="label-${key}" onchange="triggerSave()" type="text" value="${s.label}" class="editable-label text-sm font-black uppercase truncate w-28 px-1 text-slate-800 dark:text-white" style="color: ${s.color}">
                             </div>
                             <button onclick="deleteSensor('${key}')" class="text-rose-500 hover:text-rose-600 dark:hover:text-rose-400"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5 h-5"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" /></svg></button>
                         </div>
@@ -1051,31 +1529,22 @@ def get_gui():
                             <div class="flex items-center gap-1">
                                 <span class="text-sm text-slate-500 font-bold mr-1">ID:</span>
                                 <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                                    <button onclick="stepVal('id-${key}', -1)" class="w-8 py-1 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
-                                    <input id="id-${key}" type="number" value="${s.id}" class="bg-white dark:bg-black w-10 text-center py-1 text-slate-800 dark:text-white font-black text-base outline-none">
-                                    <button onclick="stepVal('id-${key}', 1)" class="w-8 py-1 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                                    <button onclick="stepVal('id-${key}', -1)" class="w-8 py-1 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 no-select">-</button>
+                                    <input id="id-${key}" onchange="triggerSave()" type="number" value="${s.id}" class="bg-white dark:bg-black w-10 text-center py-1 text-slate-800 dark:text-white font-black text-base outline-none">
+                                    <button onclick="stepVal('id-${key}', 1)" class="w-8 py-1 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 no-select">+</button>
                                 </div>
-                                <button onclick="openCalModal(${s.id}, '${s.type}', '${s.label}')" class="admin-only ${adminHidden} bg-indigo-100 text-indigo-600 hover:bg-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-400 dark:hover:bg-indigo-800/60 px-3 py-1.5 rounded text-xs font-black uppercase tracking-wider border border-indigo-200 dark:border-indigo-800 transition-colors shadow-sm ml-2">HW CAL</button>
                             </div>
                         </div>
                         
-                        <div class="admin-only ${adminHidden} mt-4 pt-4 border-t border-slate-300 dark:border-slate-700/50 flex gap-4">
-                            <div class="flex-1 flex flex-col gap-2">
-                                <span class="text-xs text-slate-500 font-bold tracking-widest uppercase">A (Slope) =</span>
-                                <div class="flex items-center bg-white dark:bg-black border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                                    <button onclick="stepVal('a-${key}', -0.01)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">-</button>
-                                    <input id="a-${key}" type="number" step="0.0001" value="${s.a !== undefined ? s.a : 1.0}" class="w-full text-center bg-transparent text-slate-800 dark:text-white font-black text-sm outline-none focus:text-indigo-500">
-                                    <button onclick="stepVal('a-${key}', 0.01)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">+</button>
-                                </div>
-                            </div>
-                            <div class="flex-1 flex flex-col gap-2">
-                                <span class="text-xs text-slate-500 font-bold tracking-widest uppercase">B (Offset) =</span>
-                                <div class="flex items-center bg-white dark:bg-black border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                                    <button onclick="stepVal('b-${key}', -0.1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">-</button>
-                                    <input id="b-${key}" type="number" step="0.0001" value="${s.b !== undefined ? s.b : 0.0}" class="w-full text-center bg-transparent text-slate-800 dark:text-white font-black text-sm outline-none focus:text-indigo-500">
-                                    <button onclick="stepVal('b-${key}', 0.1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">+</button>
-                                </div>
-                            </div>
+                        <div class="mt-4 pt-4 border-t border-slate-300 dark:border-slate-700/50 flex gap-2">
+                            <button onclick="openCalModal('${key}', ${s.id}, '${s.type}', '${s.label}')" class="flex-1 bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-400 dark:hover:bg-indigo-800/60 py-2 rounded text-[11px] font-black uppercase tracking-wider border border-indigo-200 dark:border-indigo-800 transition-colors shadow-sm flex items-center justify-center gap-1.5">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M10.5 6h9.75M10.5 6a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0M3.75 6H7.5m3 12h9.75m-9.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-3.75 0H7.5m9-6h3.75m-3.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-9.75 0h9.75" /></svg>
+                                CALIBRATION
+                            </button>
+                            <button onclick="openCleanModal('${key}', '${s.label}')" class="flex-1 bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/40 dark:text-sky-400 dark:hover:bg-sky-800/60 py-2 rounded text-[11px] font-black uppercase tracking-wider border border-sky-200 dark:border-sky-800 transition-colors shadow-sm flex items-center justify-center gap-1.5">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z" /></svg>
+                                CLEANING
+                            </button>
                         </div>
                     </div>`;
                     
@@ -1087,17 +1556,17 @@ def get_gui():
                                 <div class="flex-1 flex flex-col gap-2">
                                     <span class="text-xs text-slate-500 font-bold tracking-widest uppercase">4mA Limit</span>
                                     <div class="flex items-center bg-white dark:bg-black border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                                        <button onclick="stepVal('min-${key}', -1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">-</button>
-                                        <input id="min-${key}" type="number" value="${s.min}" class="w-full text-center bg-transparent text-slate-800 dark:text-white font-black text-base outline-none">
-                                        <button onclick="stepVal('min-${key}', 1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">+</button>
+                                        <button onclick="stepVal('min-${key}', -1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 no-select">-</button>
+                                        <input id="min-${key}" onchange="triggerSave()" type="number" value="${s.min}" class="w-full text-center bg-transparent text-slate-800 dark:text-white font-black text-base outline-none">
+                                        <button onclick="stepVal('min-${key}', 1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 no-select">+</button>
                                     </div>
                                 </div>
                                 <div class="flex-1 flex flex-col gap-2">
                                     <span class="text-xs text-slate-500 font-bold tracking-widest uppercase">20mA Limit</span>
                                     <div class="flex items-center bg-white dark:bg-black border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                                        <button onclick="stepVal('max-${key}', -1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">-</button>
-                                        <input id="max-${key}" type="number" value="${s.max}" class="w-full text-center bg-transparent text-slate-800 dark:text-white font-black text-base outline-none">
-                                        <button onclick="stepVal('max-${key}', 1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 active:bg-slate-400 transition-colors no-select">+</button>
+                                        <button onclick="stepVal('max-${key}', -1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 no-select">-</button>
+                                        <input id="max-${key}" onchange="triggerSave()" type="number" value="${s.max}" class="w-full text-center bg-transparent text-slate-800 dark:text-white font-black text-base outline-none">
+                                        <button onclick="stepVal('max-${key}', 1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 no-select">+</button>
                                     </div>
                                 </div>
                             </div>
@@ -1209,47 +1678,6 @@ def get_gui():
                 } catch (e) {}
             }
 
-            async function saveEngineering(isFromModal = false) {
-                if(!isFromModal) {
-                    configData.relay_id = parseInt(document.getElementById('eng-relay-id').value);
-                    configData.ao_id = parseInt(document.getElementById('eng-ao-id').value);
-                    
-                    for(const key of Object.keys(configData.sensors)) {
-                        configData.sensors[key].id = parseInt(document.getElementById('id-' + key).value);
-                        configData.sensors[key].enabled = document.getElementById('en-' + key).checked;
-                        configData.sensors[key].label = document.getElementById('label-' + key).value;
-                        
-                        const minIn = document.getElementById('min-' + key);
-                        const maxIn = document.getElementById('max-' + key);
-                        if(minIn) configData.sensors[key].min = parseFloat(minIn.value);
-                        if(maxIn) configData.sensors[key].max = parseFloat(maxIn.value);
-                        
-                        if(isAdmin) {
-                            const aIn = document.getElementById('a-' + key);
-                            const bIn = document.getElementById('b-' + key);
-                            if(aIn) configData.sensors[key].a = parseFloat(aIn.value);
-                            if(bIn) configData.sensors[key].b = parseFloat(bIn.value);
-                        }
-                    }
-                }
-                
-                await fetch('/api/save_config', {
-                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(configData)
-                });
-                
-                closeModal();
-                isInitialized = false; 
-                
-                const btn = document.getElementById('save-btn');
-                if(btn && !isFromModal) {
-                    const orig = btn.innerText;
-                    btn.innerText = "SAVED SUCCESSFULLY!";
-                    btn.classList.add('bg-emerald-600');
-                    setTimeout(() => { btn.innerText = orig; btn.classList.remove('bg-emerald-600'); }, 1500);
-                }
-            }
-
             setInterval(update, 1000);
         </script>
     </body>
@@ -1260,6 +1688,7 @@ def run_api(): uvicorn.run(app, host="127.0.0.1", port=5000, log_level="critical
 
 if __name__ == "__main__":
     threading.Thread(target=modbus_worker, daemon=True).start()
+    threading.Thread(target=cleaning_worker, daemon=True).start()
     threading.Thread(target=run_api, daemon=True).start()
     time.sleep(1)
     webview.create_window("WATER ANALYZER PRO", "http://127.0.0.1:5000", fullscreen=True)
