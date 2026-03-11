@@ -35,13 +35,21 @@ modbus_lock = threading.Lock()
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+BASE_UNITS = {
+    "mlss": "mg/L", "uv254": "mg/L", "do": "mg/L", "orp": "mV", 
+    "oil": "ug/L", "ph": "pH", "ec": "uS/cm", "turbidity": "NTU"
+}
+
 # --- 동적(Dynamic) 설정 ---
 DEFAULT_CONFIG = {
+    "theme": "dark",
+    "lang": "en",
+    "admin_pwd": "1234",
     "relay_id": 8,
     "ao_id": 9,
     "sensors": {
-        "s_1": {"id": 15, "type": "mlss", "enabled": True, "label": "MLSS", "color": "#94a3b8", "min": 0, "max": 10000, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel": 0},
-        "s_2": {"id": 16, "type": "uv254", "enabled": True, "label": "UV254 (COD)", "color": "#3b82f6", "min": 0, "max": 100, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel": 0}
+        "s_1": {"id": 15, "type": "mlss", "enabled": True, "label": "MLSS", "color": "#94a3b8", "unit": "mg/L", "min": 0, "max": 10000, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel": 0},
+        "s_2": {"id": 16, "type": "uv254", "enabled": True, "label": "UV254 (COD)", "color": "#3b82f6", "unit": "mg/L", "min": 0, "max": 100, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel": 0}
     }
 }
 
@@ -50,8 +58,20 @@ def load_config():
         try:
             with open(CONFIG_FILE, 'r') as f: 
                 cfg = json.load(f)
+                if "theme" not in cfg: cfg["theme"] = "dark"
+                if "lang" not in cfg: cfg["lang"] = "en"
+                if "admin_pwd" not in cfg: cfg["admin_pwd"] = "1234"
                 if "ao_id" not in cfg: cfg["ao_id"] = 9
+                if "sensors" not in cfg: cfg["sensors"] = {} 
+                
                 for k, v in cfg.get("sensors", {}).items():
+                    s_type = v.get("type", "mlss")
+                    if "unit" not in v:
+                        default_units = {
+                            "mlss":"mg/L", "uv254":"mg/L", "do":"mg/L", "orp":"mV", "oil":"ug/L",
+                            "ph":"pH", "ec":"uS/cm", "turbidity":"NTU"
+                        }
+                        v["unit"] = default_units.get(s_type, "")
                     if "min" not in v: v["min"] = 0
                     if "max" not in v: v["max"] = 100
                     if "a" not in v: v["a"] = 1.0
@@ -91,9 +111,9 @@ def init_data_structures():
     
     for key, s in config.get("sensors", {}).items():
         if s["type"] == "uv254":
-            sensor_data[key] = {"val": "--", "temp": "--", "turb": "--", "ao": "--", "status": "WAIT"}
+            sensor_data[key] = {"val": "--", "log_val": "--", "temp": "--", "turb": "--", "ao": "--", "status": "WAIT"}
         else:
-            sensor_data[key] = {"val": "--", "ao": "--", "status": "WAIT"}
+            sensor_data[key] = {"val": "--", "log_val": "--", "ao": "--", "status": "WAIT"}
         history_data[key] = [None]*30
         hourly_buffer[key] = []
         alarm_states[key] = False
@@ -145,6 +165,14 @@ def write_csv_log(filepath, headers, row):
             writer.writerow(row)
     except: pass
 
+def get_safe_int(val, default_val=0):
+    try:
+        if val is None or str(val).strip() == "" or str(val) == "NaN":
+            return default_val
+        return int(val)
+    except:
+        return default_val
+
 def trigger_cleaning(key, force_mode=None, force_dur=None, force_rel=None):
     global clean_relay_off
     s = config.get("sensors", {}).get(key)
@@ -163,10 +191,11 @@ def trigger_cleaning(key, force_mode=None, force_dur=None, force_rel=None):
                     read_with_retry(instr.write_registers, 12544, [1], retries=2)
         
         elif c_mode == "external":
-            c_rel = force_rel if force_rel is not None else int(s.get("c_rel", 0))
-            c_dur = force_dur if force_dur is not None else int(s.get("c_dur", 10))
+            c_rel = force_rel if force_rel is not None else get_safe_int(s.get("c_rel", 0))
+            c_dur = force_dur if force_dur is not None else get_safe_int(s.get("c_dur", 10))
+            r_id = get_safe_int(config.get("relay_id", 8), 8)
             with modbus_lock:
-                instr = create_instrument(int(config.get("relay_id", 8)))
+                instr = create_instrument(r_id)
                 read_with_retry(instr.write_bit, c_rel, 1, 5, retries=2)
                 
             clean_relay_off[c_rel] = time.time() + c_dur
@@ -186,7 +215,7 @@ def cleaning_worker():
             c_mode = s.get("c_mode", "off")
             if c_mode == "off": continue
             
-            c_int_sec = int(s.get("c_int", 30)) * 60
+            c_int_sec = get_safe_int(s.get("c_int", 30)) * 60
             if c_int_sec <= 0: continue
             
             if key not in clean_last_run:
@@ -199,8 +228,9 @@ def cleaning_worker():
         for ch, off_time in list(clean_relay_off.items()):
             if now >= off_time:
                 try:
+                    r_id = get_safe_int(config.get("relay_id", 8), 8)
                     with modbus_lock:
-                        instr = create_instrument(int(config.get("relay_id", 8)))
+                        instr = create_instrument(r_id)
                         read_with_retry(instr.write_bit, int(ch), 0, 5, retries=2)
                     relay_states[int(ch)] = 0
                     del clean_relay_off[ch]
@@ -233,7 +263,8 @@ def modbus_worker():
                     continue
                     
                 s_type = s.get("type")
-                s_id = int(s.get("id"))
+                s_id = get_safe_int(s.get("id"), 1)
+                s_unit = s.get("unit", "")
                 ao_val = 4.0
                 
                 try:
@@ -251,7 +282,8 @@ def modbus_worker():
                             raw_val = decode_dcba(c_r)
                             sensor_data[key]["temp"] = f"{decode_dcba(t_r):.1f}"
                             sensor_data[key]["turb"] = f"{decode_dcba(tr_r):.2f}"
-                        elif s_type in ["orp", "oil", "do"]:
+                        # 추가된 범용 센서들 통신 로직 병합
+                        elif s_type in ["orp", "oil", "do", "ph", "ec", "turbidity"]:
                             read_with_retry(instr.read_register, 12288, 0, 3)
                             raw_val = decode_dcba(read_with_retry(instr.read_registers, 9730, 2, 3))
                         
@@ -259,17 +291,29 @@ def modbus_worker():
                         if raw_val is not None:
                             a_val = float(s.get("a", 1.0))
                             b_val = float(s.get("b", 0.0))
-                            val_num = (raw_val * a_val) + b_val
+                            base_val = (raw_val * a_val) + b_val
+                            
+                            val_num = base_val
+                            # 단위 변환 로직
+                            if s_type == "oil" and s_unit in ["mg/L", "ppm"]:
+                                val_num = base_val / 1000.0
+                            elif s_type == "mlss" and s_unit == "g/L":
+                                val_num = base_val / 1000.0
+                            elif s_type == "mlss" and s_unit == "%":
+                                val_num = base_val / 10000.0
+                            elif s_type == "ec" and s_unit == "mS/cm":
+                                val_num = base_val / 1000.0
                             
                             fmt = "{:.1f}" if s_type == "orp" else "{:.2f}"
                             sensor_data[key]["val"] = fmt.format(val_num)
+                            sensor_data[key]["log_val"] = fmt.format(base_val)
                         
                         min_v = float(s.get("min", 0))
                         max_v = float(s.get("max", 100))
                         
                         if val_num is not None:
                             if key not in hourly_buffer: hourly_buffer[key] = []
-                            hourly_buffer[key].append(val_num)
+                            hourly_buffer[key].append(base_val)
                             
                             is_alarm = val_num >= (max_v * 0.9)
                             if is_alarm and not alarm_states.get(key, False):
@@ -290,13 +334,14 @@ def modbus_worker():
                     if key in active_keys:
                         ch_index = active_keys.index(key) 
                         if ch_index < 4: 
-                            ao_id = int(config.get("ao_id", 9))
-                            ao_int = int(ao_val * 1000) 
                             try:
+                                ao_id = get_safe_int(config.get("ao_id", 9), 9)
+                                ao_int = int(ao_val * 1000) 
                                 with modbus_lock:
                                     instr_ao = create_instrument(ao_id)
                                     read_with_retry(instr_ao.write_register, ch_index, ao_int, 0, 6, retries=1)
-                            except Exception: pass
+                            except Exception: 
+                                pass 
                             
                     if len(history_data[key]) > 0: history_data[key].pop(0)
                     history_data[key].append(val_num)
@@ -308,6 +353,7 @@ def modbus_worker():
                         sensor_data[key]["turb"] = "Err"
                     else: 
                         sensor_data[key]["val"] = "Err"
+                    sensor_data[key]["log_val"] = "Err"
                     sensor_data[key]["ao"] = "0.00"
                     sensor_data[key]["status"] = "ERR"
                     if len(history_data[key]) > 0: history_data[key].pop(0)
@@ -315,13 +361,13 @@ def modbus_worker():
 
             if all_keys:
                 if now.minute % 5 == 0 and now.minute != last_5min_minute:
-                    headers = ["Time"] + [config["sensors"][k]["label"] for k in all_keys]
-                    row = [now.strftime("%Y-%m-%d %H:%M:00")] + [sensor_data.get(k, {}).get("val", "--") for k in all_keys]
+                    headers = ["Time"] + [f"{config['sensors'][k]['label']} ({BASE_UNITS.get(config['sensors'][k].get('type'), '')})" for k in all_keys]
+                    row = [now.strftime("%Y-%m-%d %H:%M:00")] + [sensor_data.get(k, {}).get("log_val", "--") for k in all_keys]
                     write_csv_log(LOG_5MIN, headers, row)
                     last_5min_minute = now.minute
 
                 if now.minute == 0 and now.hour != last_1hr_hour:
-                    headers = ["Time"] + [config["sensors"][k]["label"] + " (AVG)" for k in all_keys]
+                    headers = ["Time"] + [f"{config['sensors'][k]['label']} ({BASE_UNITS.get(config['sensors'][k].get('type'), '')} AVG)" for k in all_keys]
                     row = [now.strftime("%Y-%m-%d %H:00:00")]
                     for k in all_keys:
                         vals = [v for v in hourly_buffer.get(k, []) if v is not None]
@@ -378,8 +424,9 @@ async def update_cfg(request: Request):
 def toggle_relay(ch: int, state: int):
     relay_states[ch] = state
     try:
+        r_id = get_safe_int(config.get("relay_id", 8), 8)
         with modbus_lock:
-            instr = create_instrument(int(config.get("relay_id", 8)))
+            instr = create_instrument(r_id)
             read_with_retry(instr.write_bit, ch, state, 5, retries=2)
     except: pass
     return {"status": "ok"}
@@ -388,9 +435,6 @@ def toggle_relay(ch: int, state: int):
 def trigger_clean_api(key: str, mode: str = None, dur: int = 10, rel: int = 0):
     return trigger_cleaning(key, force_mode=mode, force_dur=dur, force_rel=rel)
 
-# ==========================================
-# ADVANCED EXPORT ENGINE (Патч 8.0)
-# ==========================================
 @app.get("/api/export_options")
 def get_export_options(type: str):
     file_map = {"5min": LOG_5MIN, "1hr": LOG_1HR, "alarm": LOG_ALARM}
@@ -406,14 +450,13 @@ def get_export_options(type: str):
             dates = set()
             for row in reader:
                 if row and len(row) > 0:
-                    # '2026-03-11 15:30:00' 에서 '2026-03-11' 날짜만 추출
                     date_part = row[0].split(' ')[0]
                     dates.add(date_part)
         
         return {
             "status": "ok", 
             "columns": headers, 
-            "dates": sorted(list(dates), reverse=True) # 최신 날짜가 위로 오게
+            "dates": sorted(list(dates), reverse=True)
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -446,7 +489,6 @@ async def export_execute(request: Request):
             
             headers = next(reader, [])
             
-            # 사용자가 선택한 컬럼의 인덱스 추출 (항상 Time은 포함)
             col_indices = [i for i, h in enumerate(headers) if h in sel_cols]
             if 0 not in col_indices and "Time" in headers:
                 col_indices.insert(0, headers.index("Time"))
@@ -454,10 +496,8 @@ async def export_execute(request: Request):
             if not col_indices:
                 return {"status": "error", "message": "No columns selected"}
             
-            # 필터링된 헤더 쓰기
             writer.writerow([headers[i] for i in col_indices])
             
-            # 필터링된 행(데이터) 쓰기
             for row in reader:
                 if not row: continue
                 date_part = row[0].split(' ')[0]
@@ -516,7 +556,7 @@ def exit_app():
 def get_gui():
     return """
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang="en" class="dark">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -568,35 +608,37 @@ def get_gui():
             input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
             input[type="number"] { -moz-appearance: textfield; }
             .no-select { user-select: none; -webkit-user-select: none; }
+
+            input[type="color"] { -webkit-appearance: none; border: none; padding: 0; background: transparent; }
+            input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+            input[type="color"]::-webkit-color-swatch { border: 2px solid #cbd5e1; border-radius: 6px; transition: border-color 0.2s; }
+            .dark input[type="color"]::-webkit-color-swatch { border-color: #475569; }
+            input[type="color"]:hover::-webkit-color-swatch { border-color: #94a3b8; }
+            .dark input[type="color"]:hover::-webkit-color-swatch { border-color: #94a3b8; }
         </style>
-        <script>
-            window.isAppDark = true;
-            try {
-                if (window.localStorage && window.localStorage.getItem('theme') === 'light') {
-                    window.isAppDark = false;
-                }
-            } catch(e) {}
-            if (window.isAppDark) document.documentElement.classList.add('dark');
-        </script>
     </head>
     <body class="h-screen flex flex-col relative bg-slate-100 dark:bg-[#020617] text-slate-800 dark:text-[#f8fafc]">
 
         <nav class="flex gap-8 px-8 py-4 bg-white dark:bg-slate-900/50 border-b border-slate-300 dark:border-slate-800 items-center shrink-0 z-10 transition-colors">
-            <button onclick="showTab('dash')" id="btn-dash" class="nav-btn active text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400">Dashboard</button>
-            <button onclick="showTab('trends')" id="btn-trends" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400">Trends</button>
-            <button onclick="showTab('logs')" id="btn-logs" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400">Logs</button>
-            <button onclick="showTab('ctrl')" id="btn-ctrl" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400">Control</button>
-            
-            <button onclick="requestAdminTab('eng')" id="btn-eng" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400">Setup</button>
+            <button onclick="showTab('dash')" id="btn-dash" class="nav-btn active text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400" data-i18n="nav_dash">Dashboard</button>
+            <button onclick="showTab('trends')" id="btn-trends" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400" data-i18n="nav_trends">Trends</button>
+            <button onclick="showTab('logs')" id="btn-logs" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400" data-i18n="nav_logs">Logs</button>
+            <button onclick="showTab('ctrl')" id="btn-ctrl" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400" data-i18n="nav_ctrl">Control</button>
+            <button onclick="requestAdminTab('eng')" id="btn-eng" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400" data-i18n="nav_setup">Setup</button>
             
             <div class="flex-grow"></div>
             
-            <button onclick="toggleTheme()" id="btn-theme" class="text-slate-600 dark:text-amber-400 text-sm font-bold bg-slate-200 dark:bg-slate-800/80 px-4 py-1.5 rounded hover:bg-slate-300 dark:hover:bg-slate-700 transition-colors flex items-center gap-2 mr-4 border border-slate-300 dark:border-slate-700">
-                <span id="theme-icon" class="w-4 h-4 flex items-center justify-center"></span> <span class="text-xs tracking-wider uppercase">Theme</span>
-            </button>
+            <div class="flex items-center gap-3 mr-6">
+                <button onclick="toggleLang()" class="text-slate-600 dark:text-sky-400 text-sm font-bold bg-slate-200 dark:bg-slate-800/80 px-4 py-1.5 rounded hover:bg-slate-300 dark:hover:bg-slate-700 transition-colors flex items-center border border-slate-300 dark:border-slate-700 shadow-sm">
+                    <span id="text-lang" class="text-xs tracking-wider uppercase">ENG</span>
+                </button>
+                <button onclick="toggleTheme()" id="btn-theme" class="text-slate-600 dark:text-amber-400 text-sm font-bold bg-slate-200 dark:bg-slate-800/80 px-4 py-1.5 rounded hover:bg-slate-300 dark:hover:bg-slate-700 transition-colors flex items-center border border-slate-300 dark:border-slate-700 shadow-sm">
+                    <span class="text-xs tracking-wider uppercase" data-i18n="theme">Theme</span>
+                </button>
+            </div>
             
             <div id="sys-clock" class="text-cyan-700 dark:text-cyan-600/80 font-mono text-sm font-bold mr-6 tracking-widest">----/--/-- --:--:--</div>
-            <button onclick="fetch('/api/exit')" class="text-rose-600 dark:text-rose-500 text-sm font-bold bg-rose-100 dark:bg-rose-950/30 px-4 py-1.5 rounded hover:bg-rose-200 dark:hover:bg-rose-900/50 transition-colors border border-rose-200 dark:border-rose-900/50">EXIT</button>
+            <button onclick="fetch('/api/exit')" class="text-rose-600 dark:text-rose-500 text-sm font-bold bg-rose-100 dark:bg-rose-950/30 px-4 py-1.5 rounded hover:bg-rose-200 dark:hover:bg-rose-900/50 transition-colors border border-rose-200 dark:border-rose-900/50 shadow-sm" data-i18n="exit">EXIT</button>
         </nav>
 
         <main id="tab-dash" class="p-6 flex gap-4 flex-grow overflow-hidden min-h-0">
@@ -604,14 +646,14 @@ def get_gui():
                 <div id="dashboard-grid" class="grid gap-4 flex-grow min-h-0"></div>
                 <div id="dash-chart-wrapper" class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-3 h-[25vh] min-h-[150px] hidden flex-col shrink-0">
                     <div class="flex justify-between items-center mb-1">
-                        <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-10">MINI TREND</span>
+                        <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-10" data-i18n="mini_trend">MINI TREND</span>
                     </div>
                     <div id="dash-canvas-container" class="relative flex-grow min-h-0 w-full"></div>
                 </div>
             </div>
             
             <div class="w-[280px] 2xl:w-[320px] flex flex-col gap-3 shrink-0 min-h-0">
-                <h2 class="text-xs font-black text-slate-500 uppercase tracking-widest shrink-0 px-2">System Status</h2>
+                <h2 class="text-xs font-black text-slate-500 uppercase tracking-widest shrink-0 px-2" data-i18n="sys_status">System Status</h2>
                 <div id="status-sidebar" class="overflow-y-auto space-y-3 pr-2 pb-4 flex-grow min-h-0"></div>
             </div>
         </main>
@@ -619,8 +661,8 @@ def get_gui():
         <main id="tab-trends" class="p-6 hidden flex-grow overflow-hidden flex flex-col min-h-0">
             <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg flex-grow p-6 flex flex-col min-h-0">
                 <div class="flex justify-between items-center mb-4 shrink-0">
-                    <span id="chart-title" class="text-sm font-bold text-slate-500 dark:text-slate-400 uppercase tracking-widest">MULTI-TREND ANALYSIS</span>
-                    <button onclick="setChartMode('all')" class="bg-slate-100 dark:bg-slate-800 text-cyan-600 dark:text-cyan-400 text-xs px-4 py-2 rounded font-bold hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors border border-slate-300 dark:border-slate-700">SHOW ALL LINES</button>
+                    <span id="chart-title" class="text-sm font-bold text-slate-500 dark:text-slate-400 uppercase tracking-widest" data-i18n="multi_trend">MULTI-TREND ANALYSIS</span>
+                    <button onclick="setChartMode('all')" class="bg-slate-100 dark:bg-slate-800 text-cyan-600 dark:text-cyan-400 text-xs px-4 py-2 rounded font-bold hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors border border-slate-300 dark:border-slate-700" data-i18n="show_all">SHOW ALL LINES</button>
                 </div>
                 <div id="trend-canvas-container" class="relative flex-grow min-h-0 w-full"></div>
             </div>
@@ -629,13 +671,12 @@ def get_gui():
         <main id="tab-logs" class="p-6 hidden flex-grow overflow-hidden flex flex-col min-h-0 gap-4">
             <div class="flex justify-between items-center shrink-0">
                 <div class="flex gap-2">
-                    <button onclick="setLogView('5min')" id="btn-v-5min" class="log-tab-btn active px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400">5-Min Data</button>
-                    <button onclick="setLogView('1hr')" id="btn-v-1hr" class="log-tab-btn px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400">1-Hour AVG</button>
-                    <button onclick="setLogView('alarm')" id="btn-v-alarm" class="log-tab-btn px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400">Alarm History</button>
+                    <button onclick="setLogView('5min')" id="btn-v-5min" class="log-tab-btn active px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400" data-i18n="log_5min">5-Min Data</button>
+                    <button onclick="setLogView('1hr')" id="btn-v-1hr" class="log-tab-btn px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400" data-i18n="log_1hr">1-Hour AVG</button>
+                    <button onclick="setLogView('alarm')" id="btn-v-alarm" class="log-tab-btn px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400" data-i18n="log_alarm">Alarm History</button>
                 </div>
                 <button id="btn-export" onclick="openExportModal()" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-6 py-2 rounded uppercase tracking-wider shadow-lg flex items-center gap-2 transition-colors border border-emerald-700">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" /></svg>
-                    Export to Desktop
+                    <span data-i18n="export">Export to Desktop</span>
                 </button>
             </div>
             <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg overflow-auto flex-grow min-h-0">
@@ -648,13 +689,13 @@ def get_gui():
 
         <main id="tab-ctrl" class="p-6 hidden flex-grow flex items-center justify-center min-h-0">
             <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-8 w-full max-w-3xl border-t-4 border-t-cyan-500 dark:border-t-cyan-900/30">
-                <h2 class="text-cyan-600 dark:text-cyan-400 font-black text-xl mb-6 uppercase border-b border-slate-300 dark:border-slate-700 pb-4">Manual Relay Override</h2>
+                <h2 class="text-cyan-600 dark:text-cyan-400 font-black text-xl mb-6 uppercase border-b border-slate-300 dark:border-slate-700 pb-4" data-i18n="manual_or">Manual Relay Override</h2>
                 <div class="grid grid-cols-2 gap-8">
                     <script>
                         ['Pump 1 (Inlet)', 'Pump 2 (Outlet)', 'Aerator', 'Drain Valve'].forEach((name, i) => {
                             document.write(`
                             <div class="flex items-center justify-between bg-slate-100 dark:bg-slate-800/40 p-5 rounded-xl border border-slate-300 dark:border-slate-700/50">
-                                <span class="text-sm font-bold text-slate-700 dark:text-slate-300 uppercase">${name}</span>
+                                <span class="text-sm font-bold text-slate-700 dark:text-slate-300 uppercase" data-i18n="relay_${i}">${name}</span>
                                 <label class="relative inline-flex items-center cursor-pointer">
                                     <input type="checkbox" id="relay-${i}" onchange="fetch('/api/relay?ch=${i}&state='+(this.checked?1:0))" class="sr-only peer">
                                     <div class="w-14 h-7 bg-slate-300 dark:bg-slate-900 rounded-full border border-slate-400 dark:border-slate-600 peer-checked:bg-cyan-500 transition-colors after:content-[''] after:absolute after:top-[3px] after:left-[3px] after:bg-white dark:after:bg-slate-400 after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-[28px] peer-checked:after:bg-white"></div>
@@ -671,19 +712,20 @@ def get_gui():
                 <div class="flex justify-between items-end border-b border-slate-300 dark:border-slate-700 pb-3 shrink-0">
                     <div class="flex items-center gap-4">
                         <h2 class="text-cyan-600 dark:text-cyan-400 font-black text-base uppercase flex items-center gap-3">
-                            Device Network Manager
-                            <button onclick="lockAdmin()" class="flex items-center bg-rose-100 text-rose-600 hover:bg-rose-200 dark:bg-rose-900/30 dark:text-rose-400 px-3 py-1.5 rounded text-xs font-black tracking-wider transition-colors shadow-sm border border-rose-200 dark:border-rose-800 no-select" title="Lock Admin Settings">
-                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" class="w-4 h-4 mr-1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" /></svg>
-                                LOCK
+                            <span data-i18n="dev_net">Device Network Manager</span>
+                            <button onclick="lockAdmin()" class="flex items-center bg-rose-100 text-rose-600 hover:bg-rose-200 dark:bg-rose-900/30 dark:text-rose-400 px-3 py-1.5 rounded text-xs font-black tracking-wider transition-colors shadow-sm border border-rose-200 dark:border-rose-800 no-select">
+                                <span data-i18n="lock">LOCK</span>
+                            </button>
+                            <button onclick="openChangePwdModal()" class="flex items-center bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 px-3 py-1.5 rounded text-xs font-black tracking-wider transition-colors shadow-sm border border-amber-200 dark:border-amber-800 no-select">
+                                <span data-i18n="change_pwd">CHANGE PWD</span>
                             </button>
                         </h2>
                     </div>
                     <div class="flex gap-2">
-                        <button onclick="openIoModal()" class="flex items-center gap-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 px-4 py-2 rounded text-sm font-bold hover:bg-slate-300 dark:hover:bg-slate-600 border border-slate-300 dark:border-slate-600 transition-colors">
-                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M8.25 3v1.5M4.5 8.25H3m18 0h-1.5M4.5 12H3m18 0h-1.5m-15 3.75H3m18 0h-1.5M8.25 19.5V21M12 3v1.5m0 15V21m3.75-18v1.5m0 15V21m-9-1.5h10.5a2.25 2.25 0 002.25-2.25V6.75a2.25 2.25 0 00-2.25-2.25H6.75A2.25 2.25 0 004.5 6.75v10.5a2.25 2.25 0 002.25 2.25z" /></svg>
-                            I/O SETUP
+                        <button onclick="openIoModal()" class="flex items-center gap-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 px-4 py-2 rounded text-sm font-bold hover:bg-slate-300 dark:hover:bg-slate-600 border border-slate-300 dark:border-slate-600 transition-colors shadow-sm">
+                            <span data-i18n="io_setup">I/O SETUP</span>
                         </button>
-                        <button onclick="openModal()" class="bg-emerald-600 text-white px-4 py-2 rounded text-sm font-bold hover:bg-emerald-500 transition-colors">+ ADD SENSOR</button>
+                        <button onclick="openModal()" class="bg-emerald-600 text-white px-4 py-2 rounded text-sm font-bold hover:bg-emerald-500 border border-emerald-700 transition-colors shadow-sm" data-i18n="add_sensor">+ ADD SENSOR</button>
                     </div>
                 </div>
                 <div id="eng-sensors" class="grid grid-cols-2 gap-4 mt-2 overflow-y-auto pr-2 flex-grow min-h-0 content-start"></div>
@@ -692,7 +734,7 @@ def get_gui():
             <div class="flex flex-col gap-6 w-1/3 min-h-0">
                 <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-6 flex flex-col gap-4 flex-grow min-h-0">
                     <div class="border-b border-slate-300 dark:border-slate-700 pb-3 flex justify-between items-end shrink-0">
-                        <h2 class="text-emerald-600 dark:text-emerald-500 font-black text-base uppercase">4-20mA Scaling</h2>
+                        <h2 class="text-emerald-600 dark:text-emerald-500 font-black text-base uppercase" data-i18n="ao_scaling">4-20mA Scaling</h2>
                     </div>
                     <div id="eng-ao-scaling" class="overflow-y-auto pr-2 flex-grow min-h-0 content-start flex flex-col gap-3"></div>
                 </div>
@@ -701,52 +743,47 @@ def get_gui():
 
         <div id="export-modal-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
             <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[600px] p-6 shadow-2xl flex flex-col max-h-[90vh]">
-                <h2 class="text-emerald-600 dark:text-emerald-500 font-black text-xl mb-4 shrink-0 uppercase border-b border-slate-200 dark:border-slate-800 pb-3">Advanced Data Export</h2>
-                
+                <h2 class="text-emerald-600 dark:text-emerald-500 font-black text-xl mb-4 shrink-0 uppercase border-b border-slate-200 dark:border-slate-800 pb-3" data-i18n="export_title">Advanced Data Export</h2>
                 <div class="flex gap-6 flex-grow min-h-0 overflow-hidden">
                     <div class="w-1/2 flex flex-col min-h-0">
-                        <h3 class="text-xs font-black text-slate-500 uppercase tracking-widest mb-2 shrink-0">1. Select Dates</h3>
-                        <div id="export-dates-container" class="flex-grow overflow-y-auto border border-slate-200 dark:border-slate-700 rounded bg-slate-50 dark:bg-slate-800/50 p-2 space-y-1">
-                            </div>
+                        <h3 class="text-xs font-black text-slate-500 uppercase tracking-widest mb-2 shrink-0" data-i18n="export_dates">1. Select Dates</h3>
+                        <div id="export-dates-container" class="flex-grow overflow-y-auto border border-slate-200 dark:border-slate-700 rounded bg-slate-50 dark:bg-slate-800/50 p-2 space-y-1"></div>
                     </div>
-                    
                     <div class="w-1/2 flex flex-col min-h-0">
-                        <h3 class="text-xs font-black text-slate-500 uppercase tracking-widest mb-2 shrink-0">2. Select Sensors</h3>
-                        <div id="export-cols-container" class="flex-grow overflow-y-auto border border-slate-200 dark:border-slate-700 rounded bg-slate-50 dark:bg-slate-800/50 p-2 space-y-1">
-                            </div>
+                        <h3 class="text-xs font-black text-slate-500 uppercase tracking-widest mb-2 shrink-0" data-i18n="export_sensors">2. Select Sensors</h3>
+                        <div id="export-cols-container" class="flex-grow overflow-y-auto border border-slate-200 dark:border-slate-700 rounded bg-slate-50 dark:bg-slate-800/50 p-2 space-y-1"></div>
                     </div>
                 </div>
-                
                 <div class="flex justify-end gap-3 mt-6 shrink-0">
-                    <button onclick="closeExportModal()" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600">CANCEL</button>
-                    <button id="btn-execute-export" onclick="executeAdvancedExport()" class="px-5 py-2.5 bg-emerald-600 rounded text-sm font-bold text-white hover:bg-emerald-500 border border-emerald-700 shadow-lg">DOWNLOAD CSV</button>
+                    <button onclick="closeExportModal()" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600" data-i18n="cancel">CANCEL</button>
+                    <button id="btn-execute-export" onclick="executeAdvancedExport()" class="px-5 py-2.5 bg-emerald-600 rounded text-sm font-bold text-white hover:bg-emerald-500 border border-emerald-700 shadow-lg" data-i18n="download_csv">DOWNLOAD CSV</button>
                 </div>
             </div>
         </div>
 
         <div id="io-modal-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
             <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[400px] p-6 shadow-2xl flex flex-col">
-                <h2 class="text-slate-700 dark:text-slate-300 font-black text-xl mb-4 shrink-0 uppercase border-b border-slate-200 dark:border-slate-800 pb-3">I/O Modules Setup</h2>
+                <h2 class="text-slate-700 dark:text-slate-300 font-black text-xl mb-4 shrink-0 uppercase border-b border-slate-200 dark:border-slate-800 pb-3" data-i18n="io_setup">I/O Modules Setup</h2>
                 <div class="flex flex-col gap-4">
                     <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700">
-                        <label class="block text-xs font-black text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-widest">Relay Module (KM6073) ID</label>
-                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                            <button onclick="stepVal('eng-relay-id', -1)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
-                            <input onchange="triggerSave()" type="number" id="eng-relay-id" class="w-full bg-white dark:bg-black text-center py-2 text-slate-900 dark:text-white text-lg font-bold focus:outline-none focus:border-cyan-500">
-                            <button onclick="stepVal('eng-relay-id', 1)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                        <label class="block text-xs font-black text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-widest" data-i18n="relay_module_id">Relay Module (KM6073) ID</label>
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
+                            <button onclick="stepVal('eng-relay-id', -1)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
+                            <input onchange="triggerSave()" type="number" id="eng-relay-id" class="w-full bg-transparent text-center py-2 text-slate-900 dark:text-white text-lg font-bold outline-none">
+                            <button onclick="stepVal('eng-relay-id', 1)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                         </div>
                     </div>
                     <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700">
-                        <label class="block text-xs font-black text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-widest">Analog Output (KM6023) ID</label>
-                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                            <button onclick="stepVal('eng-ao-id', -1)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">-</button>
-                            <input onchange="triggerSave()" type="number" id="eng-ao-id" class="w-full bg-white dark:bg-black text-center py-2 text-slate-900 dark:text-white text-lg font-bold focus:outline-none focus:border-cyan-500">
-                            <button onclick="stepVal('eng-ao-id', 1)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 active:bg-slate-400 no-select">+</button>
+                        <label class="block text-xs font-black text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-widest" data-i18n="ao_module_id">Analog Output (KM6023) ID</label>
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
+                            <button onclick="stepVal('eng-ao-id', -1)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
+                            <input onchange="triggerSave()" type="number" id="eng-ao-id" class="w-full bg-transparent text-center py-2 text-slate-900 dark:text-white text-lg font-bold outline-none">
+                            <button onclick="stepVal('eng-ao-id', 1)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                         </div>
                     </div>
                 </div>
                 <div class="flex justify-end gap-3 mt-6">
-                    <button onclick="closeIoModal()" class="px-6 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm">CLOSE</button>
+                    <button onclick="closeIoModal()" class="px-6 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm" data-i18n="close">CLOSE</button>
                 </div>
             </div>
         </div>
@@ -755,58 +792,85 @@ def get_gui():
             <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[350px] p-6 shadow-2xl flex flex-col">
                 <div class="flex justify-between items-center mb-4">
                     <h2 class="text-amber-600 dark:text-amber-500 font-black text-xl uppercase tracking-wider flex items-center gap-2">
-                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" class="w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" /></svg>
-                        Admin Login
+                        <span data-i18n="admin_login">Admin Login</span>
                     </h2>
                 </div>
                 <div class="space-y-4">
                     <div>
-                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">PASSWORD</label>
-                        <input type="password" id="admin-pwd-input" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-white text-base focus:outline-none focus:border-amber-500" placeholder="Enter password..." onkeypress="if(event.key === 'Enter') verifyAdmin()">
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5" data-i18n="password">PASSWORD</label>
+                        <input type="password" id="admin-pwd-input" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-white text-base focus:outline-none focus:border-amber-500" placeholder="****" onkeypress="if(event.key === 'Enter') verifyAdmin()">
                         <p id="admin-error" class="text-xs text-rose-500 font-bold mt-2 hidden">Incorrect password!</p>
                     </div>
                 </div>
                 <div class="flex justify-end gap-3 mt-6">
-                    <button onclick="closeAdminModal()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600">CANCEL</button>
-                    <button onclick="verifyAdmin()" class="px-5 py-2 bg-amber-600 rounded text-sm font-bold text-white hover:bg-amber-500 border border-amber-700">UNLOCK</button>
+                    <button onclick="closeAdminModal()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm" data-i18n="cancel">CANCEL</button>
+                    <button onclick="verifyAdmin()" class="px-5 py-2 bg-amber-600 rounded text-sm font-bold text-white hover:bg-amber-500 border border-amber-700 shadow-sm" data-i18n="unlock">UNLOCK</button>
+                </div>
+            </div>
+        </div>
+        
+        <div id="pwd-modal-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
+            <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[350px] p-6 shadow-2xl flex flex-col">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-amber-600 dark:text-amber-500 font-black text-xl uppercase tracking-wider flex items-center gap-2">
+                        <span data-i18n="change_pwd">CHANGE PWD</span>
+                    </h2>
+                </div>
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5" data-i18n="new_pwd">NEW PASSWORD</label>
+                        <input type="password" id="new-pwd-input" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-white text-base focus:outline-none focus:border-amber-500" placeholder="***">
+                    </div>
+                </div>
+                <div class="flex justify-end gap-3 mt-6">
+                    <button onclick="closeChangePwdModal()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm" data-i18n="cancel">CANCEL</button>
+                    <button onclick="saveNewPwd()" class="px-5 py-2 bg-amber-600 rounded text-sm font-bold text-white hover:bg-amber-500 border border-amber-700 shadow-sm" data-i18n="save">SAVE</button>
                 </div>
             </div>
         </div>
 
         <div id="modal-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
             <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[450px] p-6 shadow-2xl max-h-[90vh] overflow-y-auto flex flex-col">
-                <h2 class="text-cyan-600 dark:text-cyan-400 font-black text-xl mb-4 shrink-0 uppercase">Add New Sensor</h2>
+                <h2 class="text-cyan-600 dark:text-cyan-400 font-black text-xl mb-4 shrink-0 uppercase" data-i18n="add_sensor">Add New Sensor</h2>
                 <div class="space-y-4 flex-grow min-h-0">
                     <div>
-                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">SENSOR TYPE</label>
-                        <select id="new-type" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-black dark:text-black text-base focus:outline-none focus:border-cyan-500">
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5" data-i18n="sensor_type">SENSOR TYPE</label>
+                        <select id="new-type" onchange="updateNewSensorUnits()" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-black text-base focus:outline-none focus:border-cyan-500">
                             <option value="mlss">MLSS (Suspended Solids)</option>
                             <option value="uv254">UV254 (COD/BOD)</option>
                             <option value="do">DO (Dissolved Oxygen)</option>
                             <option value="orp">ORP</option>
                             <option value="oil">OIL IN WATER</option>
+                            <option value="ph">pH</option>
+                            <option value="ec">CONDUCTIVITY (EC)</option>
+                            <option value="turbidity">TURBIDITY</option>
                         </select>
                     </div>
                     <div>
-                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">MODBUS ID (1-247)</label>
-                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
-                            <button onclick="stepVal('new-id', -1)" class="w-12 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
-                            <input type="number" id="new-id" class="w-full bg-slate-50 dark:bg-slate-800 text-center p-2.5 text-slate-900 dark:text-white font-black text-lg outline-none">
-                            <button onclick="stepVal('new-id', 1)" class="w-12 py-2.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5" data-i18n="unit_label">UNIT</label>
+                        <select id="new-unit" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-black text-base focus:outline-none focus:border-cyan-500">
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5" data-i18n="modbus_id">MODBUS ID (1-247)</label>
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
+                            <button onclick="stepVal('new-id', -1)" class="w-12 py-2.5 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
+                            <input type="number" id="new-id" class="w-full bg-transparent text-center p-2.5 text-slate-900 dark:text-white font-black text-lg outline-none">
+                            <button onclick="stepVal('new-id', 1)" class="w-12 py-2.5 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                         </div>
                     </div>
                     <div>
-                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">DISPLAY LABEL</label>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5" data-i18n="display_label">DISPLAY LABEL</label>
                         <input type="text" id="new-label" placeholder="e.g. DO 3 (Tank 2)" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-white text-base focus:outline-none focus:border-cyan-500">
                     </div>
                     <div>
-                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5">CHART COLOR</label>
-                        <input type="color" id="new-color" class="w-full h-10 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded cursor-pointer">
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5" data-i18n="chart_color">CHART COLOR</label>
+                        <input type="color" id="new-color" class="w-full h-10 bg-transparent border border-slate-300 dark:border-slate-600 rounded cursor-pointer">
                     </div>
                 </div>
                 <div class="flex justify-end gap-3 mt-6 shrink-0">
-                    <button onclick="closeModal()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600">CANCEL</button>
-                    <button onclick="confirmAddSensor()" class="px-5 py-2 bg-emerald-600 rounded text-sm font-bold text-white hover:bg-emerald-500 border border-emerald-700">ADD DEVICE</button>
+                    <button onclick="closeModal()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm" data-i18n="cancel">CANCEL</button>
+                    <button onclick="confirmAddSensor()" class="px-5 py-2 bg-emerald-600 rounded text-sm font-bold text-white hover:bg-emerald-500 border border-emerald-700 shadow-sm" data-i18n="add_sensor">ADD DEVICE</button>
                 </div>
             </div>
         </div>
@@ -822,57 +886,52 @@ def get_gui():
                 <input type="hidden" id="cal-sensor-type">
                 
                 <div class="mb-6">
-                    <h3 class="text-sm font-bold text-slate-800 dark:text-slate-200 uppercase mb-3 border-b border-slate-200 dark:border-slate-700 pb-1">1. HMI Software (y = A*x + B)</h3>
-                    <p class="text-xs text-slate-500 mb-3">Adjusts the displayed value on the screen.</p>
+                    <h3 class="text-sm font-bold text-slate-800 dark:text-slate-200 uppercase mb-3 border-b border-slate-200 dark:border-slate-700 pb-1" data-i18n="sw_cal">1. HMI Software (y = A*x + B)</h3>
                     <div class="space-y-3">
                         <div class="flex items-center gap-3">
                             <span class="w-20 text-xs font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest text-right">A (Slope)</span>
-                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
-                                <button onclick="stepVal('cal-soft-a', -0.01)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
-                                <input type="number" step="0.0001" id="cal-soft-a" onchange="triggerSave()" class="w-full bg-white dark:bg-black text-center py-1.5 text-slate-900 dark:text-white text-base font-mono font-bold outline-none">
-                                <button onclick="stepVal('cal-soft-a', 0.01)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
+                                <button onclick="stepVal('cal-soft-a', -0.01)" class="w-10 py-1.5 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
+                                <input type="number" step="0.0001" id="cal-soft-a" onchange="triggerSave()" class="w-full bg-transparent text-center py-1.5 text-slate-900 dark:text-white text-base font-mono font-bold outline-none">
+                                <button onclick="stepVal('cal-soft-a', 0.01)" class="w-10 py-1.5 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                             </div>
                         </div>
                         <div class="flex items-center gap-3">
                             <span class="w-20 text-xs font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest text-right">B (Offset)</span>
-                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
-                                <button onclick="stepVal('cal-soft-b', -0.1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
-                                <input type="number" step="0.0001" id="cal-soft-b" onchange="triggerSave()" class="w-full bg-white dark:bg-black text-center py-1.5 text-slate-900 dark:text-white text-base font-mono font-bold outline-none">
-                                <button onclick="stepVal('cal-soft-b', 0.1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
+                                <button onclick="stepVal('cal-soft-b', -0.1)" class="w-10 py-1.5 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
+                                <input type="number" step="0.0001" id="cal-soft-b" onchange="triggerSave()" class="w-full bg-transparent text-center py-1.5 text-slate-900 dark:text-white text-base font-mono font-bold outline-none">
+                                <button onclick="stepVal('cal-soft-b', 0.1)" class="w-10 py-1.5 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                             </div>
                         </div>
                     </div>
                 </div>
 
                 <div>
-                    <h3 class="text-sm font-bold text-rose-600 dark:text-rose-400 uppercase mb-3 border-b border-rose-200 dark:border-rose-900/50 pb-1">2. Sensor Hardware (Modbus)</h3>
-                    <p class="text-xs text-rose-500 mb-3 font-bold flex items-center">
-                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" class="w-4 h-4 mr-1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
-                        Writes directly to physical sensor memory.
-                    </p>
+                    <h3 class="text-sm font-bold text-rose-600 dark:text-rose-400 uppercase mb-3 border-b border-rose-200 dark:border-rose-900/50 pb-1" data-i18n="hw_cal">2. Sensor Hardware (Modbus)</h3>
                     <div class="space-y-3">
                         <div class="flex items-center gap-3">
                             <span class="w-20 text-xs font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest text-right">K (Span)</span>
-                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
-                                <button onclick="stepVal('cal-hw-k', -0.01)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
-                                <input type="number" step="0.0001" id="cal-hw-k" class="w-full bg-slate-50 dark:bg-slate-800 text-center py-1.5 text-slate-900 dark:text-white text-base font-mono font-bold outline-none" placeholder="Reading...">
-                                <button onclick="stepVal('cal-hw-k', 0.01)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
+                                <button onclick="stepVal('cal-hw-k', -0.01)" class="w-10 py-1.5 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
+                                <input type="number" step="0.0001" id="cal-hw-k" class="w-full bg-transparent text-center py-1.5 text-slate-900 dark:text-white text-base font-mono font-bold outline-none" placeholder="Reading...">
+                                <button onclick="stepVal('cal-hw-k', 0.01)" class="w-10 py-1.5 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                             </div>
                         </div>
                         <div class="flex items-center gap-3">
                             <span class="w-20 text-xs font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest text-right">B (Zero)</span>
-                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
-                                <button onclick="stepVal('cal-hw-b', -0.1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
-                                <input type="number" step="0.0001" id="cal-hw-b" class="w-full bg-slate-50 dark:bg-slate-800 text-center py-1.5 text-slate-900 dark:text-white text-base font-mono font-bold outline-none" placeholder="Reading...">
-                                <button onclick="stepVal('cal-hw-b', 0.1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
+                                <button onclick="stepVal('cal-hw-b', -0.1)" class="w-10 py-1.5 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
+                                <input type="number" step="0.0001" id="cal-hw-b" class="w-full bg-transparent text-center py-1.5 text-slate-900 dark:text-white text-base font-mono font-bold outline-none" placeholder="Reading...">
+                                <button onclick="stepVal('cal-hw-b', 0.1)" class="w-10 py-1.5 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                             </div>
                         </div>
                     </div>
                 </div>
                 
                 <div class="flex justify-end gap-3 mt-8">
-                    <button onclick="closeCalModal()" class="px-6 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm">CLOSE</button>
-                    <button id="cal-save-btn" onclick="saveCalibration()" class="px-5 py-2.5 bg-indigo-600 rounded text-sm font-bold text-white hover:bg-indigo-500 border border-indigo-700 shadow-lg">SAVE HW CAL</button>
+                    <button onclick="closeCalModal()" class="px-6 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm" data-i18n="close">CLOSE</button>
+                    <button id="cal-save-btn" onclick="saveCalibration()" class="px-5 py-2.5 bg-indigo-600 rounded text-sm font-bold text-white hover:bg-indigo-500 border border-indigo-700 shadow-lg" data-i18n="save_hw_cal">SAVE HW CAL</button>
                 </div>
             </div>
         </div>
@@ -880,41 +939,41 @@ def get_gui():
         <div id="clean-modal-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
             <div class="bg-white dark:bg-slate-900 border-t-4 border-t-sky-500 border border-slate-300 dark:border-slate-700 rounded-xl w-[400px] p-6 shadow-2xl flex flex-col">
                 <div class="flex justify-between items-center mb-4">
-                    <h2 id="clean-modal-title" class="text-sky-600 dark:text-sky-400 font-black text-xl uppercase tracking-wider">CLEANING SETUP</h2>
+                    <h2 id="clean-modal-title" class="text-sky-600 dark:text-sky-400 font-black text-xl uppercase tracking-wider" data-i18n="clean_title">CLEANING SETUP</h2>
                 </div>
                 
                 <input type="hidden" id="clean-sensor-key">
                 
                 <div class="space-y-5">
                     <div>
-                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest">Control Mode</label>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest" data-i18n="ctrl_mode">Control Mode</label>
                         <select id="clean-mode" onchange="updateCleanUI(); triggerSave();" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-black font-bold text-sm focus:outline-none focus:border-sky-500">
-                            <option value="off">OFF (No Cleaning)</option>
-                            <option value="internal">INTERNAL (Sensor Wiper)</option>
-                            <option value="external">EXTERNAL (KM6073 Relay)</option>
+                            <option value="off" data-i18n="opt_off">OFF (No Cleaning)</option>
+                            <option value="internal" data-i18n="opt_int">INTERNAL (Sensor Wiper)</option>
+                            <option value="external" data-i18n="opt_ext">EXTERNAL (KM6073 Relay)</option>
                         </select>
                     </div>
                     
                     <div id="clean-int-block" class="hidden">
-                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest">Interval (Minutes)</label>
-                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
-                            <button onclick="stepVal('clean-int', -5)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
-                            <input onchange="triggerSave()" type="number" id="clean-int" class="w-full bg-slate-50 dark:bg-slate-800 text-center py-2 text-slate-900 dark:text-white font-black text-base outline-none">
-                            <button onclick="stepVal('clean-int', 5)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest" data-i18n="interval_min">Interval (Minutes)</label>
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
+                            <button onclick="stepVal('clean-int', -5)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
+                            <input onchange="triggerSave()" type="number" id="clean-int" class="w-full bg-transparent text-center py-2 text-slate-900 dark:text-white font-black text-base outline-none">
+                            <button onclick="stepVal('clean-int', 5)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                         </div>
                     </div>
 
                     <div id="clean-dur-block" class="hidden">
-                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest">Duration (Seconds)</label>
-                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden">
-                            <button onclick="stepVal('clean-dur', -1)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">-</button>
-                            <input onchange="triggerSave()" type="number" id="clean-dur" class="w-full bg-slate-50 dark:bg-slate-800 text-center py-2 text-slate-900 dark:text-white font-black text-base outline-none">
-                            <button onclick="stepVal('clean-dur', 1)" class="w-12 py-2 bg-slate-200 dark:bg-slate-700 text-lg font-black hover:bg-slate-300 no-select">+</button>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest" data-i18n="duration_sec">Duration (Seconds)</label>
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
+                            <button onclick="stepVal('clean-dur', -1)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
+                            <input onchange="triggerSave()" type="number" id="clean-dur" class="w-full bg-transparent text-center py-2 text-slate-900 dark:text-white font-black text-base outline-none">
+                            <button onclick="stepVal('clean-dur', 1)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                         </div>
                     </div>
 
                     <div id="clean-rel-block" class="hidden">
-                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest">KM6073 Relay Channel</label>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest" data-i18n="relay_channel">KM6073 Relay Channel</label>
                         <select id="clean-rel" onchange="triggerSave()" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-black font-bold text-sm focus:outline-none focus:border-sky-500">
                             <option value="0">CH 0 (Pump 1)</option>
                             <option value="1">CH 1 (Pump 2)</option>
@@ -926,10 +985,9 @@ def get_gui():
                 
                 <div class="flex justify-between items-center mt-8 pt-4 border-t border-slate-200 dark:border-slate-700">
                     <button id="btn-test-clean" onclick="testCleaning()" class="flex items-center px-4 py-2 bg-slate-100 dark:bg-slate-800 text-slate-500 font-bold rounded text-xs border border-slate-300 dark:border-slate-600 hover:bg-slate-200 transition-colors shadow-sm">
-                        <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" class="w-3.5 h-3.5 mr-1.5"><path d="M8 5v14l11-7z"/></svg>
-                        TEST NOW
+                        <span data-i18n="test_now">TEST NOW</span>
                     </button>
-                    <button onclick="closeCleanModal()" class="px-6 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm">CLOSE</button>
+                    <button onclick="closeCleanModal()" class="px-6 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm" data-i18n="close">CLOSE</button>
                 </div>
             </div>
         </div>
@@ -941,30 +999,115 @@ def get_gui():
             let configData = null;
             let isInitialized = false;
             let charts = [];
-            const unitMap = { "mlss": "mg/L", "uv254": "mg/L", "do": "mg/L", "orp": "mV", "oil": "ug/L" };
+            
+            const allowedUnits = {
+                "mlss": ["mg/L", "g/L", "ppm", "%", "NTU"],
+                "uv254": ["mg/L", "ppm"],
+                "do": ["mg/L", "ppm", "%"],
+                "orp": ["mV"],
+                "oil": ["ug/L", "ppb", "mg/L", "ppm"],
+                "ph": ["pH"],
+                "ec": ["uS/cm", "mS/cm"],
+                "turbidity": ["NTU", "FTU", "mg/L"]
+            };
+
+            const translations = {
+                en: {
+                    nav_dash: "Dashboard", nav_trends: "Trends", nav_logs: "Logs", nav_ctrl: "Control", nav_setup: "Setup", theme: "Theme", exit: "EXIT",
+                    sys_status: "System Status", mini_trend: "MINI TREND", multi_trend: "MULTI-TREND ANALYSIS", show_all: "SHOW ALL LINES",
+                    log_5min: "5-Min Data", log_1hr: "1-Hour AVG", log_alarm: "Alarm History", export: "Export to Desktop",
+                    manual_or: "Manual Relay Override", relay_0: "Pump 1 (Inlet)", relay_1: "Pump 2 (Outlet)", relay_2: "Aerator", relay_3: "Drain Valve",
+                    dev_net: "Device Network Manager", io_setup: "I/O SETUP", add_sensor: "ADD SENSOR", change_pwd: "CHANGE PWD", ao_scaling: "4-20mA Scaling",
+                    export_title: "Advanced Data Export", export_dates: "1. Select Dates", export_sensors: "2. Select Sensors", cancel: "CANCEL", download_csv: "DOWNLOAD CSV",
+                    admin_login: "Admin Login", password: "PASSWORD", unlock: "UNLOCK", new_pwd: "NEW PASSWORD", save: "SAVE", close: "CLOSE", lock: "LOCK",
+                    sw_cal: "1. HMI Software (y = A*x + B)", hw_cal: "2. Sensor Hardware (Modbus)", save_hw_cal: "SAVE HW CAL",
+                    clean_title: "CLEANING SETUP", ctrl_mode: "Control Mode", test_now: "TEST NOW",
+                    btn_cal: "CALIBRATION", btn_clean: "CLEANING", cal_title: "CALIBRATION",
+                    sensor_type: "SENSOR TYPE", unit_label: "UNIT", modbus_id: "MODBUS ID (1-247)", display_label: "DISPLAY LABEL", chart_color: "CHART COLOR",
+                    relay_module_id: "Relay Module (KM6073) ID", ao_module_id: "Analog Output (KM6023) ID",
+                    interval_min: "Interval (Minutes)", duration_sec: "Duration (Seconds)", relay_channel: "KM6073 Relay Channel",
+                    opt_off: "OFF (No Cleaning)", opt_int: "INTERNAL (Sensor Wiper)", opt_ext: "EXTERNAL (KM6073 Relay)"
+                },
+                ko: {
+                    nav_dash: "대시보드", nav_trends: "트렌드", nav_logs: "로그", nav_ctrl: "제어", nav_setup: "설정", theme: "테마", exit: "종료",
+                    sys_status: "시스템 상태", mini_trend: "미니 트렌드", multi_trend: "다중 트렌드 분석", show_all: "모든 라인 보기",
+                    log_5min: "5분 데이터", log_1hr: "1시간 평균", log_alarm: "알람 이력", export: "바탕화면 저장",
+                    manual_or: "수동 릴레이 제어", relay_0: "펌프 1 (흡입)", relay_1: "펌프 2 (배출)", relay_2: "폭기장치", relay_3: "배수 밸브",
+                    dev_net: "장치 네트워크 관리", io_setup: "I/O 설정", add_sensor: "센서 추가", change_pwd: "비밀번호 변경", ao_scaling: "4-20mA 스케일링",
+                    export_title: "데이터 추출", export_dates: "1. 날짜 선택", export_sensors: "2. 센서 선택", cancel: "취소", download_csv: "CSV 다운로드",
+                    admin_login: "관리자 로그인", password: "비밀번호", unlock: "잠금해제", new_pwd: "새 비밀번호", save: "저장", close: "닫기", lock: "잠금",
+                    sw_cal: "1. HMI 소프트웨어 (y = A*x + B)", hw_cal: "2. 센서 하드웨어 (모드버스)", save_hw_cal: "하드웨어 저장",
+                    clean_title: "세정(Cleaning) 설정", ctrl_mode: "제어 모드", test_now: "지금 테스트",
+                    btn_cal: "교정 (CAL)", btn_clean: "세정 (CLEAN)", cal_title: "센서 교정",
+                    sensor_type: "센서 종류", unit_label: "단위", modbus_id: "모드버스 ID (1-247)", display_label: "표시 이름", chart_color: "차트 색상",
+                    relay_module_id: "릴레이 모듈 (KM6073) ID", ao_module_id: "아날로그 출력 (KM6023) ID",
+                    interval_min: "작동 주기 (분)", duration_sec: "작동 시간 (초)", relay_channel: "KM6073 릴레이 채널",
+                    opt_off: "사용 안함 (OFF)", opt_int: "내부 와이퍼 (INTERNAL)", opt_ext: "외부 릴레이 (EXTERNAL)"
+                }
+            };
+
+            function applyLang() {
+                if(!configData || !configData.lang) return;
+                const lang = translations[configData.lang] ? configData.lang : 'en';
+                document.getElementById('text-lang').innerText = lang === 'en' ? 'ENG' : '한국어';
+                
+                document.querySelectorAll('[data-i18n]').forEach(el => {
+                    const key = el.getAttribute('data-i18n');
+                    if(translations[lang][key]) {
+                        el.innerText = translations[lang][key];
+                    }
+                });
+            }
+
+            function toggleLang() {
+                if(!configData) return;
+                configData.lang = configData.lang === 'en' ? 'ko' : 'en';
+                applyLang();
+                triggerSave();
+            }
+
+            function updateNewSensorUnits() {
+                const type = document.getElementById('new-type').value;
+                const unitSelect = document.getElementById('new-unit');
+                unitSelect.innerHTML = allowedUnits[type].map(u => `<option value="${u}">${u}</option>`).join('');
+            }
 
             async function triggerSave() {
                 if(!configData) return;
+                if(!configData.sensors) configData.sensors = {};
                 
                 const relayEl = document.getElementById('eng-relay-id');
-                if(relayEl) configData.relay_id = parseInt(relayEl.value);
+                if(relayEl) configData.relay_id = parseInt(relayEl.value) || 0;
                 const aoEl = document.getElementById('eng-ao-id');
-                if(aoEl) configData.ao_id = parseInt(aoEl.value);
+                if(aoEl) configData.ao_id = parseInt(aoEl.value) || 0;
                 
+                let needsRedraw = false;
+
                 for(const key of Object.keys(configData.sensors)) {
                     const idEl = document.getElementById('id-' + key);
-                    if(idEl) configData.sensors[key].id = parseInt(idEl.value);
+                    if(idEl) configData.sensors[key].id = parseInt(idEl.value) || 1;
                     
                     const enEl = document.getElementById('en-' + key);
                     if(enEl) configData.sensors[key].enabled = enEl.checked;
                     
                     const lblEl = document.getElementById('label-' + key);
-                    if(lblEl) {
+                    if(lblEl && configData.sensors[key].label !== lblEl.value) {
                         configData.sensors[key].label = lblEl.value;
-                        const dashLbl = document.querySelector(`#card-${key} .absolute`);
-                        if(dashLbl) dashLbl.innerText = lblEl.value.toUpperCase();
+                        needsRedraw = true;
                     }
                     
+                    const colorEl = document.getElementById('color-' + key);
+                    if(colorEl && configData.sensors[key].color !== colorEl.value) {
+                        configData.sensors[key].color = colorEl.value;
+                        needsRedraw = true;
+                    }
+                    
+                    const unitEl = document.getElementById('unit-' + key);
+                    if(unitEl && configData.sensors[key].unit !== unitEl.value) {
+                        configData.sensors[key].unit = unitEl.value;
+                        needsRedraw = true;
+                    }
+
                     const minIn = document.getElementById('min-' + key);
                     const maxIn = document.getElementById('max-' + key);
                     if(minIn) configData.sensors[key].min = parseFloat(minIn.value);
@@ -987,13 +1130,15 @@ def get_gui():
                     method: 'POST', headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify(configData)
                 });
+
+                if (needsRedraw) {
+                    initDynamicUI(); 
+                }
             }
 
             function toggleSensorEnabled(key, isChecked) {
                 configData.sensors[key].enabled = isChecked;
-                triggerSave().then(() => {
-                    initDynamicUI();
-                });
+                triggerSave().then(() => { initDynamicUI(); });
             }
 
             function stepVal(id, step) {
@@ -1012,6 +1157,7 @@ def get_gui():
 
             let isAdmin = false;
             let pendingTab = null;
+            let pwdFails = 0;
 
             function requestAdminTab(tab) {
                 if (isAdmin) {
@@ -1026,9 +1172,14 @@ def get_gui():
             }
 
             function verifyAdmin() {
-                const pwd = document.getElementById('admin-pwd-input').value;
-                if(pwd === "1234") {
+                const pwdInput = document.getElementById('admin-pwd-input');
+                const pwd = pwdInput.value;
+                const correctPwd = configData.admin_pwd || "1234";
+                
+                if(pwd === correctPwd) {
                     isAdmin = true;
+                    pwdFails = 0;
+                    pwdInput.value = "";
                     closeAdminModal();
                     document.getElementById('btn-eng').classList.add('text-amber-500'); 
                     if (pendingTab) {
@@ -1036,7 +1187,21 @@ def get_gui():
                         pendingTab = null;
                     }
                 } else {
-                    document.getElementById('admin-error').classList.remove('hidden');
+                    pwdFails++;
+                    pwdInput.value = ""; 
+                    
+                    if(pwdFails >= 5) {
+                        configData.admin_pwd = "1234";
+                        triggerSave();
+                        const errEl = document.getElementById('admin-error');
+                        errEl.innerText = configData.lang === 'ko' ? "비밀번호가 1234로 초기화되었습니다!" : "Password reset to default (1234)!";
+                        errEl.classList.remove('hidden');
+                        pwdFails = 0;
+                    } else {
+                        const errEl = document.getElementById('admin-error');
+                        errEl.innerText = configData.lang === 'ko' ? `비밀번호 오류! (${pwdFails}/5)` : `Incorrect password! (${pwdFails}/5)`;
+                        errEl.classList.remove('hidden');
+                    }
                 }
             }
 
@@ -1048,6 +1213,25 @@ def get_gui():
 
             function closeAdminModal() { document.getElementById('admin-modal-overlay').classList.add('hidden'); }
 
+            function openChangePwdModal() {
+                document.getElementById('new-pwd-input').value = '';
+                document.getElementById('pwd-modal-overlay').classList.remove('hidden');
+                setTimeout(() => document.getElementById('new-pwd-input').focus(), 100);
+            }
+            
+            function closeChangePwdModal() { document.getElementById('pwd-modal-overlay').classList.add('hidden'); }
+            
+            function saveNewPwd() {
+                const newPwd = document.getElementById('new-pwd-input').value;
+                if(newPwd.trim() === '') {
+                    alert(configData.lang === 'ko' ? "비밀번호를 입력하세요." : "Please enter a password.");
+                    return;
+                }
+                configData.admin_pwd = newPwd;
+                triggerSave();
+                closeChangePwdModal();
+            }
+
             function openIoModal() {
                 document.getElementById('eng-relay-id').value = configData.relay_id;
                 document.getElementById('eng-ao-id').value = configData.ao_id;
@@ -1055,24 +1239,23 @@ def get_gui():
             }
             function closeIoModal() { document.getElementById('io-modal-overlay').classList.add('hidden'); }
 
-            const iconSun = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v2.25m6.364.386l-1.591 1.591M21 12h-2.25m-.386 6.364l-1.591-1.591M12 18.75V21m-4.773-4.227l-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z" /></svg>`;
-            const iconMoon = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M21.752 15.002A9.718 9.718 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 009.002-5.998z" /></svg>`;
-
-            let isDark = window.isAppDark;
-            document.getElementById('theme-icon').innerHTML = isDark ? iconSun : iconMoon;
+            let isDark = true; 
+            let themeInitialized = false;
+            let langInitialized = false;
             
             function toggleTheme() {
                 const html = document.documentElement;
                 isDark = !html.classList.contains('dark');
                 if (isDark) {
                     html.classList.add('dark');
-                    document.getElementById('theme-icon').innerHTML = iconSun;
                 } else {
                     html.classList.remove('dark');
-                    document.getElementById('theme-icon').innerHTML = iconMoon;
                 }
-                try { if (window.localStorage) window.localStorage.setItem('theme', isDark ? 'dark' : 'light'); } catch(e) {}
                 updateChartColors();
+                if(configData) {
+                    configData.theme = isDark ? 'dark' : 'light';
+                    triggerSave();
+                }
             }
 
             function updateChartColors() {
@@ -1115,7 +1298,6 @@ def get_gui():
                 update();
             }
 
-            // === ADVANCED EXPORT ENGINE ===
             async function openExportModal() {
                 const btn = document.getElementById('btn-export');
                 const origHTML = btn.innerHTML;
@@ -1126,8 +1308,14 @@ def get_gui():
                     const data = await res.json();
                     
                     if (data.status !== 'ok' || data.dates.length === 0) {
-                        alert("No data available to export yet.");
-                        btn.innerHTML = origHTML;
+                        btn.innerHTML = "❌ NO DATA YET";
+                        btn.classList.add('bg-rose-600', 'border-rose-700');
+                        btn.classList.remove('bg-emerald-600', 'border-emerald-700', 'hover:bg-emerald-500');
+                        setTimeout(() => { 
+                            btn.innerHTML = origHTML; 
+                            btn.classList.remove('bg-rose-600', 'border-rose-700');
+                            btn.classList.add('bg-emerald-600', 'border-emerald-700', 'hover:bg-emerald-500');
+                        }, 2000);
                         return;
                     }
                     
@@ -1143,7 +1331,6 @@ def get_gui():
                     
                     let colsHtml = '';
                     data.columns.forEach(c => {
-                        // "Time" 컬럼은 무조건 포함되므로 리스트에서 제외하거나 수정 불가로 만듦
                         if(c === 'Time') return; 
                         colsHtml += `
                         <label class="flex items-center gap-3 p-2 hover:bg-slate-200 dark:hover:bg-slate-700 rounded cursor-pointer transition-colors">
@@ -1155,7 +1342,14 @@ def get_gui():
                     
                     document.getElementById('export-modal-overlay').classList.remove('hidden');
                 } catch (e) {
-                    alert("Error loading export options.");
+                    btn.innerHTML = "❌ ERROR";
+                    btn.classList.add('bg-rose-600', 'border-rose-700');
+                    btn.classList.remove('bg-emerald-600', 'border-emerald-700', 'hover:bg-emerald-500');
+                    setTimeout(() => { 
+                        btn.innerHTML = origHTML; 
+                        btn.classList.remove('bg-rose-600', 'border-rose-700');
+                        btn.classList.add('bg-emerald-600', 'border-emerald-700', 'hover:bg-emerald-500');
+                    }, 2000);
                 }
                 
                 btn.innerHTML = origHTML;
@@ -1170,13 +1364,16 @@ def get_gui():
                 const selectedDates = Array.from(dateCbs).map(cb => cb.value);
                 const selectedCols = Array.from(colCbs).map(cb => cb.value);
                 
+                const btn = document.getElementById('btn-execute-export');
+                const origText = btn.innerText;
+
                 if (selectedDates.length === 0 || selectedCols.length === 0) {
-                    alert("Please select at least one date and one sensor.");
+                    btn.innerText = "❌ SELECT OPTIONS";
+                    btn.classList.replace('bg-emerald-600', 'bg-rose-600');
+                    setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-emerald-600'); }, 2000);
                     return;
                 }
                 
-                const btn = document.getElementById('btn-execute-export');
-                const origText = btn.innerText;
                 btn.innerText = "⏳ SAVING...";
                 
                 try {
@@ -1189,22 +1386,23 @@ def get_gui():
                     
                     if (data.status === 'ok') {
                         btn.innerText = "✅ SAVED TO DESKTOP";
-                        btn.classList.add('bg-cyan-600');
-                        setTimeout(() => { closeExportModal(); btn.innerText = origText; btn.classList.remove('bg-cyan-600'); }, 1500);
+                        btn.classList.replace('bg-emerald-600', 'bg-cyan-600');
+                        setTimeout(() => { closeExportModal(); btn.innerText = origText; btn.classList.replace('bg-cyan-600', 'bg-emerald-600'); }, 1500);
                     } else {
                         btn.innerText = "❌ FAILED";
-                        btn.classList.add('bg-rose-600');
-                        setTimeout(() => { btn.innerText = origText; btn.classList.remove('bg-rose-600'); }, 2000);
+                        btn.classList.replace('bg-emerald-600', 'bg-rose-600');
+                        setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-emerald-600'); }, 2000);
                     }
                 } catch (e) {
                     btn.innerText = "❌ ERROR";
-                    btn.classList.add('bg-rose-600');
-                    setTimeout(() => { btn.innerText = origText; btn.classList.remove('bg-rose-600'); }, 2000);
+                    btn.classList.replace('bg-emerald-600', 'bg-rose-600');
+                    setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-emerald-600'); }, 2000);
                 }
             }
 
             function openModal() { 
                 document.getElementById('new-type').value = 'mlss';
+                updateNewSensorUnits(); 
                 document.getElementById('new-id').value = '21';
                 document.getElementById('new-label').value = '';
                 document.getElementById('new-color').value = '#22d3ee';
@@ -1217,20 +1415,17 @@ def get_gui():
                 const id = parseInt(document.getElementById('new-id').value);
                 const label = document.getElementById('new-label').value || type.toUpperCase();
                 const color = document.getElementById('new-color').value;
+                const unit = document.getElementById('new-unit').value;
                 const newKey = 's_' + Date.now();
-                configData.sensors[newKey] = { id: id, type: type, enabled: true, label: label, color: color, min: 0, max: 100, a: 1.0, b: 0.0, c_mode: "off", c_int: 30, c_dur: 10, c_rel: 0 };
-                triggerSave().then(() => {
-                    initDynamicUI();
-                });
+                configData.sensors[newKey] = { id: id, type: type, enabled: true, label: label, color: color, unit: unit, min: 0, max: 100, a: 1.0, b: 0.0, c_mode: "off", c_int: 30, c_dur: 10, c_rel: 0 };
+                triggerSave().then(() => { initDynamicUI(); });
                 closeModal();
             }
 
             function deleteSensor(key) {
-                if(confirm('Are you sure you want to delete this sensor?')) {
+                if(confirm(configData.lang === 'ko' ? '이 센서를 삭제하시겠습니까?' : 'Are you sure you want to delete this sensor?')) {
                     delete configData.sensors[key];
-                    triggerSave().then(() => {
-                        initDynamicUI();
-                    });
+                    triggerSave().then(() => { initDynamicUI(); });
                 }
             }
 
@@ -1238,7 +1433,10 @@ def get_gui():
                 document.getElementById('cal-sensor-key').value = key;
                 document.getElementById('cal-sensor-id').value = id;
                 document.getElementById('cal-sensor-type').value = type;
-                document.getElementById('cal-modal-title').innerText = label + " CALIBRATION";
+                
+                const safeLabel = label ? label.replace(/'/g, "\\'") : "SENSOR";
+                document.getElementById('cal-modal-title').innerHTML = safeLabel + ` <span data-i18n="cal_title"></span>`;
+                applyLang(); 
                 
                 const s = configData.sensors[key];
                 document.getElementById('cal-soft-a').value = s.a !== undefined ? s.a : 1.0;
@@ -1278,7 +1476,7 @@ def get_gui():
                 const btn = document.getElementById('cal-save-btn');
 
                 if (isNaN(hwK) || isNaN(hwB)) {
-                    alert("Please enter valid numeric values.");
+                    alert(configData.lang === 'ko' ? "올바른 숫자를 입력하세요." : "Please enter valid numeric values.");
                     return;
                 }
 
@@ -1314,7 +1512,10 @@ def get_gui():
 
             function openCleanModal(key, label) {
                 document.getElementById('clean-sensor-key').value = key;
-                document.getElementById('clean-modal-title').innerText = label + " CLEANING";
+                
+                const safeLabel = label ? label.replace(/'/g, "\\'") : "SENSOR";
+                document.getElementById('clean-modal-title').innerHTML = safeLabel + ` <span data-i18n="clean_title"></span>`;
+                applyLang();
                 
                 const s = configData.sensors[key];
                 document.getElementById('clean-mode').value = s.c_mode || 'off';
@@ -1393,7 +1594,6 @@ def get_gui():
                 document.querySelectorAll('.sensor-card').forEach(c => c.classList.remove('active-chart'));
                 
                 if (mode === 'all') {
-                    document.getElementById('chart-title').innerText = 'MULTI-TREND ANALYSIS';
                     if(charts[0]) charts[0].options.plugins.legend.display = false; 
                     if(charts[1]) charts[1].options.plugins.legend.display = true;
                     charts.forEach(c => {
@@ -1403,7 +1603,6 @@ def get_gui():
                 } else {
                     const el = document.getElementById('card-' + mode);
                     if(el) el.classList.add('active-chart');
-                    document.getElementById('chart-title').innerText = configData.sensors[mode].label + ' ISOLATED TREND';
                     if(charts[0]) charts[0].options.plugins.legend.display = false;
                     if(charts[1]) charts[1].options.plugins.legend.display = false;
                     charts.forEach(c => {
@@ -1414,6 +1613,8 @@ def get_gui():
             }
 
             function initDynamicUI() {
+                if (!configData.sensors) configData.sensors = {};
+                
                 const activeSensors = Object.entries(configData.sensors).filter(([k, v]) => v.enabled);
                 const count = activeSensors.length;
                 
@@ -1439,7 +1640,10 @@ def get_gui():
                     dashChartWrap.style.display = 'none';
                 }
 
-                if (count === 0) grid.innerHTML = `<div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-10 flex items-center justify-center text-slate-500 font-bold col-span-full">NO SENSORS ENABLED. GO TO SETUP.</div>`;
+                if (count === 0) {
+                    const textNoSensors = configData.lang === 'ko' ? "활성화된 센서가 없습니다. 설정(SETUP)으로 이동하세요." : "NO SENSORS ENABLED. GO TO SETUP.";
+                    grid.innerHTML = `<div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-10 flex items-center justify-center text-slate-500 font-bold col-span-full">${textNoSensors}</div>`;
+                }
 
                 let valSize, unitSize, lblSize;
                 if (count === 1) { valSize = '22vh'; unitSize = '5vh'; lblSize = '3vh'; }
@@ -1448,7 +1652,7 @@ def get_gui():
                 else { valSize = '7vh'; unitSize = '2vh'; lblSize = '1.5vh'; }
 
                 activeSensors.forEach(([key, s]) => {
-                    const unit = unitMap[s.type] || "";
+                    const unit = s.unit || ""; 
                     let extraHtml = '';
                     if (s.type === 'uv254') {
                         extraHtml = `
@@ -1512,38 +1716,50 @@ def get_gui():
                 let aoHTML = '';
 
                 for(const [key, s] of Object.entries(configData.sensors)) {
+                    const lang = configData.lang === 'ko' ? 'ko' : 'en';
+                    const unitOptions = allowedUnits[s.type] ? allowedUnits[s.type].map(u => `<option value="${u}" ${s.unit === u ? 'selected' : ''}>${u}</option>`).join('') : `<option value="">--</option>`;
+                    const safeLabel = s.label ? s.label.replace(/'/g, "\\'") : "SENSOR";
+
                     engHTML += `
                     <div class="bg-slate-100 dark:bg-slate-800/40 p-4 rounded-lg border border-slate-300 dark:border-slate-700/50 h-auto flex flex-col justify-between">
                         <div class="flex justify-between items-center border-b border-slate-300 dark:border-slate-700/50 pb-3 mb-3">
-                            <div class="flex items-center gap-4">
-                                <label class="relative inline-flex items-center cursor-pointer">
+                            <div class="flex items-center gap-3 w-full pr-2">
+                                <label class="relative inline-flex items-center cursor-pointer shrink-0">
                                     <input type="checkbox" id="en-${key}" onchange="toggleSensorEnabled('${key}', this.checked)" ${s.enabled ? 'checked' : ''} class="sr-only peer">
                                     <div class="w-12 h-6 bg-slate-300 dark:bg-slate-900 rounded-full border border-slate-400 dark:border-slate-600 peer-checked:bg-emerald-500 transition-colors after:absolute after:top-[1px] after:left-[2px] after:bg-white dark:after:bg-slate-400 after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-[24px] peer-checked:after:bg-white"></div>
                                 </label>
-                                <input id="label-${key}" onchange="triggerSave()" type="text" value="${s.label}" class="editable-label text-sm font-black uppercase truncate w-28 px-1 text-slate-800 dark:text-white" style="color: ${s.color}">
+                                <input type="color" id="color-${key}" onchange="triggerSave()" value="${s.color}" class="bg-transparent w-6 h-6 rounded cursor-pointer shrink-0" title="Change Sensor Color">
+                                <input id="label-${key}" onchange="triggerSave()" type="text" value="${s.label}" class="editable-label text-sm font-black uppercase truncate flex-1 min-w-[50px] px-1 text-slate-800 dark:text-white" style="color: ${s.color}">
                             </div>
-                            <button onclick="deleteSensor('${key}')" class="text-rose-500 hover:text-rose-600 dark:hover:text-rose-400"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5 h-5"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" /></svg></button>
+                            <button onclick="deleteSensor('${key}')" class="text-rose-500 hover:text-rose-600 dark:hover:text-rose-400 shrink-0"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5 h-5"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" /></svg></button>
                         </div>
-                        <div class="flex justify-between items-center">
-                            <span class="text-sm text-slate-500 font-bold tracking-wide">TYPE: ${s.type.toUpperCase()}</span>
-                            <div class="flex items-center gap-1">
-                                <span class="text-sm text-slate-500 font-bold mr-1">ID:</span>
-                                <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                                    <button onclick="stepVal('id-${key}', -1)" class="w-8 py-1 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 no-select">-</button>
-                                    <input id="id-${key}" onchange="triggerSave()" type="number" value="${s.id}" class="bg-white dark:bg-black w-10 text-center py-1 text-slate-800 dark:text-white font-black text-base outline-none">
-                                    <button onclick="stepVal('id-${key}', 1)" class="w-8 py-1 bg-slate-200 dark:bg-slate-700 font-black text-slate-700 dark:text-slate-300 hover:bg-slate-300 no-select">+</button>
+                        
+                        <div class="flex justify-between items-center mt-2">
+                            <span class="text-[11px] text-slate-500 font-bold tracking-widest uppercase">${s.type}</span>
+                            <div class="flex items-center">
+                                <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
+                                    <span class="px-2 py-1 bg-transparent text-xs font-black text-slate-500 dark:text-slate-400 uppercase tracking-wider border-r border-slate-300 dark:border-slate-600">ID</span>
+                                    <button onclick="stepVal('id-${key}', -1)" class="w-7 py-1 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
+                                    <input id="id-${key}" onchange="triggerSave()" type="number" value="${s.id}" class="w-8 text-center bg-transparent text-slate-800 dark:text-white font-black text-xs outline-none no-spin">
+                                    <button onclick="stepVal('id-${key}', 1)" class="w-7 py-1 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
+                                </div>
+                                
+                                <div class="ml-3 pl-3 border-l border-slate-300 dark:border-slate-700">
+                                    <select id="unit-${key}" onchange="triggerSave()" class="bg-white dark:bg-slate-200 border border-slate-300 dark:border-slate-600 rounded py-1 px-2 text-slate-900 dark:text-black font-bold text-xs shadow-sm focus:outline-none focus:ring-1 focus:ring-cyan-500 cursor-pointer">
+                                        ${unitOptions}
+                                    </select>
                                 </div>
                             </div>
                         </div>
                         
                         <div class="mt-4 pt-4 border-t border-slate-300 dark:border-slate-700/50 flex gap-2">
-                            <button onclick="openCalModal('${key}', ${s.id}, '${s.type}', '${s.label}')" class="flex-1 bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-400 dark:hover:bg-indigo-800/60 py-2 rounded text-[11px] font-black uppercase tracking-wider border border-indigo-200 dark:border-indigo-800 transition-colors shadow-sm flex items-center justify-center gap-1.5">
+                            <button onclick="openCalModal('${key}', ${s.id}, '${s.type}', '${safeLabel}')" class="flex-1 bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-400 dark:hover:bg-indigo-800/60 py-2 rounded text-[11px] font-black uppercase tracking-wider border border-indigo-200 dark:border-indigo-800 transition-colors shadow-sm flex items-center justify-center gap-1.5">
                                 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M10.5 6h9.75M10.5 6a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0M3.75 6H7.5m3 12h9.75m-9.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-3.75 0H7.5m9-6h3.75m-3.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-9.75 0h9.75" /></svg>
-                                CALIBRATION
+                                <span>${translations[lang].btn_cal}</span>
                             </button>
-                            <button onclick="openCleanModal('${key}', '${s.label}')" class="flex-1 bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/40 dark:text-sky-400 dark:hover:bg-sky-800/60 py-2 rounded text-[11px] font-black uppercase tracking-wider border border-sky-200 dark:border-sky-800 transition-colors shadow-sm flex items-center justify-center gap-1.5">
+                            <button onclick="openCleanModal('${key}', '${safeLabel}')" class="flex-1 bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/40 dark:text-sky-400 dark:hover:bg-sky-800/60 py-2 rounded text-[11px] font-black uppercase tracking-wider border border-sky-200 dark:border-sky-800 transition-colors shadow-sm flex items-center justify-center gap-1.5">
                                 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z" /></svg>
-                                CLEANING
+                                <span>${translations[lang].btn_clean}</span>
                             </button>
                         </div>
                     </div>`;
@@ -1555,18 +1771,18 @@ def get_gui():
                             <div class="flex gap-4">
                                 <div class="flex-1 flex flex-col gap-2">
                                     <span class="text-xs text-slate-500 font-bold tracking-widest uppercase">4mA Limit</span>
-                                    <div class="flex items-center bg-white dark:bg-black border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                                        <button onclick="stepVal('min-${key}', -1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 no-select">-</button>
+                                    <div class="flex items-center bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                                        <button onclick="stepVal('min-${key}', -1)" class="w-10 py-1.5 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
                                         <input id="min-${key}" onchange="triggerSave()" type="number" value="${s.min}" class="w-full text-center bg-transparent text-slate-800 dark:text-white font-black text-base outline-none">
-                                        <button onclick="stepVal('min-${key}', 1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 no-select">+</button>
+                                        <button onclick="stepVal('min-${key}', 1)" class="w-10 py-1.5 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                                     </div>
                                 </div>
                                 <div class="flex-1 flex flex-col gap-2">
                                     <span class="text-xs text-slate-500 font-bold tracking-widest uppercase">20mA Limit</span>
-                                    <div class="flex items-center bg-white dark:bg-black border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
-                                        <button onclick="stepVal('max-${key}', -1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 no-select">-</button>
+                                    <div class="flex items-center bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm">
+                                        <button onclick="stepVal('max-${key}', -1)" class="w-10 py-1.5 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
                                         <input id="max-${key}" onchange="triggerSave()" type="number" value="${s.max}" class="w-full text-center bg-transparent text-slate-800 dark:text-white font-black text-base outline-none">
-                                        <button onclick="stepVal('max-${key}', 1)" class="w-10 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-black hover:bg-slate-300 no-select">+</button>
+                                        <button onclick="stepVal('max-${key}', 1)" class="w-10 py-1.5 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                                     </div>
                                 </div>
                             </div>
@@ -1577,6 +1793,7 @@ def get_gui():
                 document.getElementById('eng-ao-scaling').innerHTML = aoHTML;
                 
                 isInitialized = true;
+                applyLang();
                 setChartMode('all');
             }
 
@@ -1584,11 +1801,35 @@ def get_gui():
                 try {
                     const res = await fetch('/api/all');
                     const d = await res.json();
-                    if(!isInitialized) { configData = d.config; initDynamicUI(); }
+                    
+                    if(!isInitialized) { 
+                        configData = d.config; 
+                        if (!configData.sensors) configData.sensors = {}; 
+                        
+                        if (configData.theme && !themeInitialized) {
+                            themeInitialized = true;
+                            if (configData.theme === 'light') {
+                                document.documentElement.classList.remove('dark');
+                                document.getElementById('theme-icon').innerHTML = iconMoon;
+                                isDark = false;
+                            } else {
+                                document.documentElement.classList.add('dark');
+                                document.getElementById('theme-icon').innerHTML = iconSun;
+                                isDark = true;
+                            }
+                            updateChartColors();
+                        }
+                        if (configData.lang && !langInitialized) {
+                            langInitialized = true;
+                            applyLang();
+                        }
+                        
+                        initDynamicUI(); 
+                    }
 
                     if(currentTab === 'dash' || currentTab === 'trends') {
                         let sidebarHTML = '';
-                        const activeSensors = Object.entries(configData.sensors).filter(([k, v]) => v.enabled);
+                        const activeSensors = Object.entries(configData.sensors || {}).filter(([k, v]) => v.enabled);
                         
                         activeSensors.forEach(([key, s]) => {
                             const d_s = d.data[key];
