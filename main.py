@@ -47,6 +47,7 @@ DEFAULT_CONFIG = {
     "admin_pwd": "1234",
     "relay_id": 8,
     "ao_id": 9,
+    "sys_temp": {"sensor": "", "ch": 4, "min": 0, "max": 50},
     "sensors": {
         "s_1": {"id": 15, "type": "mlss", "enabled": True, "label": "MLSS", "color": "#94a3b8", "unit": "mg/L", "min": 0, "max": 10000, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel": 0},
         "s_2": {"id": 16, "type": "uv254", "enabled": True, "label": "UV254 (COD)", "color": "#3b82f6", "unit": "mg/L", "min": 0, "max": 100, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel": 0}
@@ -62,6 +63,7 @@ def load_config():
                 if "lang" not in cfg: cfg["lang"] = "en"
                 if "admin_pwd" not in cfg: cfg["admin_pwd"] = "1234"
                 if "ao_id" not in cfg: cfg["ao_id"] = 9
+                if "sys_temp" not in cfg: cfg["sys_temp"] = {"sensor": "", "ch": 4, "min": 0, "max": 50}
                 if "sensors" not in cfg: cfg["sensors"] = {} 
                 
                 for k, v in cfg.get("sensors", {}).items():
@@ -90,7 +92,7 @@ def save_config(cfg):
 config = load_config()
 
 # --- 동적 데이터 엔진 ---
-sensor_data = {}
+sensor_data = {"sys_temp": "--", "sys_temp_ao": "0.00"}
 history_data = {}
 relay_states = [0, 0, 0, 0]
 
@@ -102,7 +104,7 @@ clean_relay_off = {}
 
 def init_data_structures():
     global sensor_data, history_data, hourly_buffer, alarm_states, clean_last_run, clean_relay_off
-    sensor_data = {"status": "Online"}
+    sensor_data = {"status": "Online", "sys_temp": "--", "sys_temp_ao": "0.00"}
     history_data = {}
     hourly_buffer = {}
     alarm_states = {}
@@ -113,7 +115,7 @@ def init_data_structures():
         if s["type"] == "uv254":
             sensor_data[key] = {"val": "--", "log_val": "--", "temp": "--", "turb": "--", "ao": "--", "status": "WAIT"}
         else:
-            sensor_data[key] = {"val": "--", "log_val": "--", "ao": "--", "status": "WAIT"}
+            sensor_data[key] = {"val": "--", "log_val": "--", "temp": "--", "ao": "--", "status": "WAIT"}
         history_data[key] = [None]*30
         hourly_buffer[key] = []
         alarm_states[key] = False
@@ -257,7 +259,7 @@ def modbus_worker():
                     
                 if not s.get("enabled", False):
                     if s["type"] == "uv254": sensor_data[key] = {"val": "Off", "temp": "--", "turb": "--", "ao": "0.00", "status": "OFF"}
-                    else: sensor_data[key] = {"val": "Off", "ao": "0.00", "status": "OFF"}
+                    else: sensor_data[key] = {"val": "Off", "temp": "--", "ao": "0.00", "status": "OFF"}
                     if len(history_data[key]) > 0: history_data[key].pop(0)
                     history_data[key].append(None)
                     continue
@@ -276,16 +278,25 @@ def modbus_worker():
                             raw_val = read_with_retry(instr.read_float, 6, 3, 2)
                         elif s_type == "uv254":
                             read_with_retry(instr.read_register, 12288, 0, 3)
-                            t_r = read_with_retry(instr.read_registers, 9728, 2, 3)
-                            c_r = read_with_retry(instr.read_registers, 9730, 2, 3)
+                            try:
+                                regs = read_with_retry(instr.read_registers, 9728, 4, 3)
+                                t_val = decode_dcba(regs[0:2])
+                                raw_val = decode_dcba(regs[2:4])
+                                sensor_data[key]["temp"] = f"{t_val:.1f}"
+                            except:
+                                c_r = read_with_retry(instr.read_registers, 9730, 2, 3)
+                                raw_val = decode_dcba(c_r)
                             tr_r = read_with_retry(instr.read_registers, 4608, 2, 3)
-                            raw_val = decode_dcba(c_r)
-                            sensor_data[key]["temp"] = f"{decode_dcba(t_r):.1f}"
                             sensor_data[key]["turb"] = f"{decode_dcba(tr_r):.2f}"
-                        # 추가된 범용 센서들 통신 로직 병합
                         elif s_type in ["orp", "oil", "do", "ph", "ec", "turbidity"]:
                             read_with_retry(instr.read_register, 12288, 0, 3)
-                            raw_val = decode_dcba(read_with_retry(instr.read_registers, 9730, 2, 3))
+                            try:
+                                regs = read_with_retry(instr.read_registers, 9728, 4, 3)
+                                t_val = decode_dcba(regs[0:2])
+                                raw_val = decode_dcba(regs[2:4])
+                                sensor_data[key]["temp"] = f"{t_val:.1f}"
+                            except:
+                                raw_val = decode_dcba(read_with_retry(instr.read_registers, 9730, 2, 3))
                         
                         val_num = None
                         if raw_val is not None:
@@ -294,7 +305,6 @@ def modbus_worker():
                             base_val = (raw_val * a_val) + b_val
                             
                             val_num = base_val
-                            # 단위 변환 로직
                             if s_type == "oil" and s_unit in ["mg/L", "ppm"]:
                                 val_num = base_val / 1000.0
                             elif s_type == "mlss" and s_unit == "g/L":
@@ -353,28 +363,66 @@ def modbus_worker():
                         sensor_data[key]["turb"] = "Err"
                     else: 
                         sensor_data[key]["val"] = "Err"
+                        sensor_data[key]["temp"] = "Err"
                     sensor_data[key]["log_val"] = "Err"
                     sensor_data[key]["ao"] = "0.00"
                     sensor_data[key]["status"] = "ERR"
                     if len(history_data[key]) > 0: history_data[key].pop(0)
                     history_data[key].append(None)
 
+            # === MASTER SYSTEM TEMP AO ===
+            sys_t_cfg = config.get("sys_temp", {})
+            m_sensor = sys_t_cfg.get("sensor")
+            
+            if m_sensor and m_sensor in sensor_data and "temp" in sensor_data[m_sensor] and sensor_data[m_sensor]["temp"] not in ["--", "Err"]:
+                try:
+                    sys_t_val = float(sensor_data[m_sensor]["temp"])
+                    t_min = float(sys_t_cfg.get("min", 0))
+                    t_max = float(sys_t_cfg.get("max", 50))
+                    
+                    if t_max <= t_min: t_ao = 4.0
+                    else:
+                        c_t = max(t_min, min(sys_t_val, t_max))
+                        t_ao = 4.0 + ((c_t - t_min) / (t_max - t_min)) * 16.0
+                        
+                    sensor_data["sys_temp"] = f"{sys_t_val:.1f}"
+                    sensor_data["sys_temp_ao"] = f"{t_ao:.2f}"
+                    
+                    # Write to AO Module
+                    t_ch = int(sys_t_cfg.get("ch", 4))
+                    ao_id = get_safe_int(config.get("ao_id", 9), 9)
+                    try:
+                        with modbus_lock:
+                            instr_ao = create_instrument(ao_id)
+                            read_with_retry(instr_ao.write_register, t_ch, int(t_ao * 1000), 0, 6, retries=1)
+                    except Exception: pass
+                except Exception:
+                    sensor_data["sys_temp"] = "--"
+                    sensor_data["sys_temp_ao"] = "0.00"
+            else:
+                sensor_data["sys_temp"] = "--"
+                sensor_data["sys_temp_ao"] = "0.00"
+
+            # === LOGS WRITING ===
             if all_keys:
                 if now.minute % 5 == 0 and now.minute != last_5min_minute:
                     headers = ["Time"] + [f"{config['sensors'][k]['label']} ({BASE_UNITS.get(config['sensors'][k].get('type'), '')})" for k in all_keys]
+                    headers.append("SYS TEMP (°C)")
                     row = [now.strftime("%Y-%m-%d %H:%M:00")] + [sensor_data.get(k, {}).get("log_val", "--") for k in all_keys]
+                    row.append(sensor_data.get("sys_temp", "--"))
                     write_csv_log(LOG_5MIN, headers, row)
                     last_5min_minute = now.minute
 
                 if now.minute == 0 and now.hour != last_1hr_hour:
                     headers = ["Time"] + [f"{config['sensors'][k]['label']} ({BASE_UNITS.get(config['sensors'][k].get('type'), '')} AVG)" for k in all_keys]
+                    headers.append("SYS TEMP (°C)")
                     row = [now.strftime("%Y-%m-%d %H:00:00")]
                     for k in all_keys:
                         vals = [v for v in hourly_buffer.get(k, []) if v is not None]
                         if vals: row.append(f"{(sum(vals)/len(vals)):.2f}")
                         else: row.append("--")
                         hourly_buffer[k] = [] 
-                    
+                    row.append(sensor_data.get("sys_temp", "--"))
                     write_csv_log(LOG_1HR, headers, row)
                     last_1hr_hour = now.hour
 
@@ -543,6 +591,40 @@ def set_cal(sensor_id: int, s_type: str, k: float, b: float):
                 payload = [k_regs[0], k_regs[1], b_regs[0], b_regs[1]]
                 read_with_retry(instr.write_registers, 4352, payload, retries=2)
             
+            return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+        
+@app.get("/api/change_sensor_id")
+def change_sensor_id(curr_id: int, new_id: int, s_type: str):
+    try:
+        with modbus_lock:
+            id_register = 25 if s_type == 'mlss' else 12288
+            instr = create_instrument(curr_id)
+            
+            try:
+                current_reg = instr.read_register(id_register, 0)
+            except Exception:
+                try:
+                    instr.address = 255
+                    current_reg = instr.read_register(id_register, 0)
+                except Exception:
+                    return {"status": "error", "message": "Timeout. Cannot read sensor."}
+            
+            if s_type == 'mlss':
+                write_val = new_id
+            else:
+                if current_reg >= 256: 
+                    baud_rate = current_reg & 0x00FF
+                    write_val = (new_id << 8) | baud_rate
+                else:
+                    write_val = new_id
+
+            try:
+                instr.write_register(id_register, write_val, 0, functioncode=6)
+            except Exception:
+                pass 
+                
             return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -722,6 +804,9 @@ def get_gui():
                         </h2>
                     </div>
                     <div class="flex gap-2">
+                        <button onclick="openIdTool()" class="flex items-center gap-1.5 bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/40 dark:text-blue-400 px-4 py-2 rounded text-sm font-bold border border-blue-200 dark:border-blue-800 transition-colors shadow-sm">
+                            <span data-i18n="id_tool">ID TOOL</span>
+                        </button>
                         <button onclick="openIoModal()" class="flex items-center gap-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 px-4 py-2 rounded text-sm font-bold hover:bg-slate-300 dark:hover:bg-slate-600 border border-slate-300 dark:border-slate-600 transition-colors shadow-sm">
                             <span data-i18n="io_setup">I/O SETUP</span>
                         </button>
@@ -755,7 +840,7 @@ def get_gui():
                     </div>
                 </div>
                 <div class="flex justify-end gap-3 mt-6 shrink-0">
-                    <button onclick="closeExportModal()" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600" data-i18n="cancel">CANCEL</button>
+                    <button onclick="closeExportModal()" class="px-5 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm" data-i18n="cancel">CANCEL</button>
                     <button id="btn-execute-export" onclick="executeAdvancedExport()" class="px-5 py-2.5 bg-emerald-600 rounded text-sm font-bold text-white hover:bg-emerald-500 border border-emerald-700 shadow-lg" data-i18n="download_csv">DOWNLOAD CSV</button>
                 </div>
             </div>
@@ -825,6 +910,40 @@ def get_gui():
                 <div class="flex justify-end gap-3 mt-6">
                     <button onclick="closeChangePwdModal()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm" data-i18n="cancel">CANCEL</button>
                     <button onclick="saveNewPwd()" class="px-5 py-2 bg-amber-600 rounded text-sm font-bold text-white hover:bg-amber-500 border border-amber-700 shadow-sm" data-i18n="save">SAVE</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="id-tool-modal" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-50 flex justify-center items-center p-4">
+            <div class="bg-white dark:bg-slate-900 border-t-4 border-t-blue-500 border border-slate-300 dark:border-slate-700 rounded-xl w-[400px] p-6 shadow-2xl flex flex-col">
+                <div class="flex justify-between items-center mb-2">
+                    <h2 class="text-blue-600 dark:text-blue-400 font-black text-xl uppercase tracking-wider" data-i18n="id_tool_title">CHANGE SENSOR ID</h2>
+                </div>
+                <p class="text-[11px] font-bold text-rose-600 dark:text-rose-400 mb-5 bg-rose-50 dark:bg-rose-950/30 p-2 rounded border border-rose-200 dark:border-rose-900/50" data-i18n="id_tool_warn">
+                    ⚠️ WARNING: Only ONE sensor must be connected to the RS485 bus during this operation!
+                </p>
+                
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-bold text-slate-500 dark:text-slate-400 mb-1.5" data-i18n="sensor_type">SENSOR TYPE</label>
+                        <select id="tool-s-type" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2 text-slate-900 dark:text-black font-bold text-sm focus:outline-none focus:border-blue-500">
+                            <option value="std" data-i18n="std_sensors">Standard (pH, DO, ORP, etc.)</option>
+                            <option value="mlss" data-i18n="mlss_sensor">MLSS Sensor</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-500 dark:text-slate-400 mb-1.5" data-i18n="current_id">CURRENT ID (255=Broadcast)</label>
+                        <input type="number" id="tool-curr-id" value="255" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2 text-slate-900 dark:text-white font-bold text-base focus:outline-none focus:border-blue-500 text-center">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-blue-600 dark:text-blue-400 mb-1.5" data-i18n="new_id">NEW ID (1-247)</label>
+                        <input type="number" id="tool-new-id" placeholder="e.g. 15" class="w-full bg-blue-50 dark:bg-blue-900/20 border border-blue-300 dark:border-blue-700 rounded p-2 text-blue-700 dark:text-blue-400 font-black text-xl focus:outline-none focus:border-blue-500 text-center shadow-inner">
+                    </div>
+                </div>
+                
+                <div class="flex justify-end gap-3 mt-6">
+                    <button onclick="closeIdTool()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm" data-i18n="close">CLOSE</button>
+                    <button id="btn-exec-id" onclick="executeChangeId()" class="px-5 py-2 bg-blue-600 rounded text-sm font-bold text-white hover:bg-blue-500 border border-blue-700 shadow-lg" data-i18n="change_id">CHANGE ID</button>
                 </div>
             </div>
         </div>
@@ -1026,7 +1145,10 @@ def get_gui():
                     sensor_type: "SENSOR TYPE", unit_label: "UNIT", modbus_id: "MODBUS ID (1-247)", display_label: "DISPLAY LABEL", chart_color: "CHART COLOR",
                     relay_module_id: "Relay Module (KM6073) ID", ao_module_id: "Analog Output (KM6023) ID",
                     interval_min: "Interval (Minutes)", duration_sec: "Duration (Seconds)", relay_channel: "KM6073 Relay Channel",
-                    opt_off: "OFF (No Cleaning)", opt_int: "INTERNAL (Sensor Wiper)", opt_ext: "EXTERNAL (KM6073 Relay)"
+                    opt_off: "OFF (No Cleaning)", opt_int: "INTERNAL (Sensor Wiper)", opt_ext: "EXTERNAL (KM6073 Relay)",
+                    id_tool: "ID TOOL", id_tool_title: "CHANGE SENSOR ID", id_tool_warn: "⚠️ WARNING: Only ONE sensor must be connected to the bus!",
+                    current_id: "CURRENT ID (255=Broadcast)", new_id: "NEW ID", change_id: "CHANGE ID", std_sensors: "Standard Sensors", mlss_sensor: "MLSS Sensor",
+                    sys_temp_setup: "Master Temperature Setup", sys_temp: "SYSTEM TEMP"
                 },
                 ko: {
                     nav_dash: "대시보드", nav_trends: "트렌드", nav_logs: "로그", nav_ctrl: "제어", nav_setup: "설정", theme: "테마", exit: "종료",
@@ -1042,7 +1164,10 @@ def get_gui():
                     sensor_type: "센서 종류", unit_label: "단위", modbus_id: "모드버스 ID (1-247)", display_label: "표시 이름", chart_color: "차트 색상",
                     relay_module_id: "릴레이 모듈 (KM6073) ID", ao_module_id: "아날로그 출력 (KM6023) ID",
                     interval_min: "작동 주기 (분)", duration_sec: "작동 시간 (초)", relay_channel: "KM6073 릴레이 채널",
-                    opt_off: "사용 안함 (OFF)", opt_int: "내부 와이퍼 (INTERNAL)", opt_ext: "외부 릴레이 (EXTERNAL)"
+                    opt_off: "사용 안함 (OFF)", opt_int: "내부 와이퍼 (INTERNAL)", opt_ext: "외부 릴레이 (EXTERNAL)",
+                    id_tool: "ID 변경 툴", id_tool_title: "센서 ID 변경", id_tool_warn: "⚠️ 주의: 통신선에 변경할 센서 1개만 연결하세요!",
+                    current_id: "현재 ID (모를경우 255)", new_id: "새로운 ID", change_id: "ID 변경", std_sensors: "일반 센서 (pH, DO, ORP 등)", mlss_sensor: "MLSS 센서",
+                    sys_temp_setup: "시스템 온도 설정 (마스터)", sys_temp: "시스템 온도"
                 }
             };
 
@@ -1080,6 +1205,13 @@ def get_gui():
                 if(relayEl) configData.relay_id = parseInt(relayEl.value) || 0;
                 const aoEl = document.getElementById('eng-ao-id');
                 if(aoEl) configData.ao_id = parseInt(aoEl.value) || 0;
+                
+                if(document.getElementById('sys-t-sensor')) {
+                    configData.sys_temp.sensor = document.getElementById('sys-t-sensor').value;
+                    configData.sys_temp.ch = parseInt(document.getElementById('sys-t-ch').value) || 4;
+                    configData.sys_temp.min = parseFloat(document.getElementById('sys-t-min').value) || 0;
+                    configData.sys_temp.max = parseFloat(document.getElementById('sys-t-max').value) || 50;
+                }
                 
                 let needsRedraw = false;
 
@@ -1150,7 +1282,7 @@ def get_gui():
                 val = Math.round(val * 10000) / 10000;
                 el.value = val;
                 
-                if(id.startsWith('id-') || id.startsWith('min-') || id.startsWith('max-') || id === 'eng-relay-id' || id === 'eng-ao-id' || id.startsWith('clean-') || id.startsWith('cal-soft-')) {
+                if(id.startsWith('id-') || id.startsWith('min-') || id.startsWith('max-') || id.startsWith('sys-') || id === 'eng-relay-id' || id === 'eng-ao-id' || id.startsWith('clean-') || id.startsWith('cal-soft-')) {
                     triggerSave();
                 }
             }
@@ -1410,6 +1542,55 @@ def get_gui():
             }
             function closeModal() { document.getElementById('modal-overlay').classList.add('hidden'); }
             
+            function openIdTool() {
+                document.getElementById('tool-curr-id').value = '255';
+                document.getElementById('tool-new-id').value = '';
+                document.getElementById('id-tool-modal').classList.remove('hidden');
+            }
+            
+            function closeIdTool() {
+                document.getElementById('id-tool-modal').classList.add('hidden');
+            }
+            
+            async function executeChangeId() {
+                const sType = document.getElementById('tool-s-type').value;
+                const currId = parseInt(document.getElementById('tool-curr-id').value);
+                const newId = parseInt(document.getElementById('tool-new-id').value);
+                
+                if (isNaN(currId) || isNaN(newId)) {
+                    alert(configData.lang === 'ko' ? '올바른 숫자를 입력하세요.' : 'Please enter valid numbers.');
+                    return;
+                }
+
+                const btn = document.getElementById('btn-exec-id');
+                const origText = btn.innerText;
+                btn.innerText = "⏳ PROCESSING...";
+                
+                try {
+                    const res = await fetch(`/api/change_sensor_id?curr_id=${currId}&new_id=${newId}&s_type=${sType}`);
+                    const data = await res.json();
+                    
+                    if (data.status === 'ok') {
+                        btn.innerText = "✅ SUCCESS";
+                        btn.classList.replace('bg-blue-600', 'bg-emerald-600');
+                        setTimeout(() => { 
+                            closeIdTool(); 
+                            btn.innerText = origText; 
+                            btn.classList.replace('bg-emerald-600', 'bg-blue-600');
+                            alert(configData.lang === 'ko' ? "ID가 변경되었습니다! 센서의 전원을 껐다 켜주세요." : "ID changed! Please reboot the sensor (power off/on).");
+                        }, 1000);
+                    } else {
+                        btn.innerText = "❌ FAILED";
+                        btn.classList.replace('bg-blue-600', 'bg-rose-600');
+                        setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-blue-600'); }, 2000);
+                        alert("Error: " + data.message);
+                    }
+                } catch(e) {
+                    btn.innerText = "❌ ERROR";
+                    btn.classList.replace('bg-blue-600', 'bg-rose-600');
+                    setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-blue-600'); }, 2000);
+                }
+            }
             function confirmAddSensor() {
                 const type = document.getElementById('new-type').value;
                 const id = parseInt(document.getElementById('new-id').value);
@@ -1627,15 +1808,19 @@ def get_gui():
                     dashChartWrap.classList.remove('hidden');
                     dashChartWrap.style.display = 'flex';
                 } else if (count === 2) {
-                    grid.className = "grid gap-4 grid-cols-1 grid-rows-2 flex-grow min-h-0";
+                    grid.className = "grid gap-4 grid-cols-2 grid-rows-1 flex-grow min-h-0"; 
                     dashChartWrap.classList.remove('hidden');
                     dashChartWrap.style.display = 'flex';
                 } else if (count <= 4) {
                     grid.className = "grid gap-4 grid-cols-2 grid-rows-2 flex-grow min-h-0";
                     dashChartWrap.classList.add('hidden');
                     dashChartWrap.style.display = 'none';
+                } else if (count <= 6) {
+                    grid.className = "grid gap-4 grid-cols-2 grid-rows-3 flex-grow min-h-0"; 
+                    dashChartWrap.classList.add('hidden');
+                    dashChartWrap.style.display = 'none';
                 } else {
-                    grid.className = "grid gap-4 grid-cols-2 grid-rows-3 flex-grow min-h-0";
+                    grid.className = "grid gap-4 grid-cols-2 grid-rows-4 flex-grow min-h-0"; 
                     dashChartWrap.classList.add('hidden');
                     dashChartWrap.style.display = 'none';
                 }
@@ -1649,9 +1834,10 @@ def get_gui():
                 if (count === 1) { valSize = '22vh'; unitSize = '5vh'; lblSize = '3vh'; }
                 else if (count === 2) { valSize = '14vh'; unitSize = '4vh'; lblSize = '2.5vh'; }
                 else if (count <= 4) { valSize = '10vh'; unitSize = '3vh'; lblSize = '2vh'; }
-                else { valSize = '7vh'; unitSize = '2vh'; lblSize = '1.5vh'; }
+                else if (count <= 6) { valSize = '7vh'; unitSize = '2vh'; lblSize = '1.5vh'; }
+                else { valSize = '5vh'; unitSize = '1.5vh'; lblSize = '1.2vh'; }
 
-                activeSensors.forEach(([key, s]) => {
+                activeSensors.forEach(([key, s], index) => {
                     const unit = s.unit || ""; 
                     let extraHtml = '';
                     if (s.type === 'uv254') {
@@ -1661,8 +1847,14 @@ def get_gui():
                             Tb: <span id="v-${key}-tr" class="text-slate-800 dark:text-white">--</span> NTU
                         </div>`;
                     }
+                    
+                    let spanClass = "";
+                    if (count > 2 && count % 2 !== 0 && index === 0) {
+                        spanClass = "col-span-2"; 
+                    }
+                    
                     grid.innerHTML += `
-                    <div id="card-${key}" onclick="focusChart('${key}')" class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg sensor-card relative overflow-hidden group flex items-center justify-center">
+                    <div id="card-${key}" onclick="focusChart('${key}')" class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg sensor-card relative overflow-hidden group flex items-center justify-center ${spanClass}">
                         <div class="absolute top-3 left-4 font-black uppercase tracking-wider" style="color: ${s.color}; font-size: ${lblSize};">${s.label}</div>
                         ${extraHtml}
                         <div class="flex items-baseline justify-center">
@@ -1714,11 +1906,17 @@ def get_gui():
 
                 let engHTML = '';
                 let aoHTML = '';
+                
+                let tempOpts = `<option value="">-- Select --</option>`;
 
                 for(const [key, s] of Object.entries(configData.sensors)) {
                     const lang = configData.lang === 'ko' ? 'ko' : 'en';
                     const unitOptions = allowedUnits[s.type] ? allowedUnits[s.type].map(u => `<option value="${u}" ${s.unit === u ? 'selected' : ''}>${u}</option>`).join('') : `<option value="">--</option>`;
                     const safeLabel = s.label ? s.label.replace(/'/g, "\\'") : "SENSOR";
+                    
+                    if(s.enabled && s.type !== 'mlss') {
+                        tempOpts += `<option value="${key}" ${configData.sys_temp.sensor === key ? 'selected' : ''}>${s.label}</option>`;
+                    }
 
                     engHTML += `
                     <div class="bg-slate-100 dark:bg-slate-800/40 p-4 rounded-lg border border-slate-300 dark:border-slate-700/50 h-auto flex flex-col justify-between">
@@ -1789,8 +1987,39 @@ def get_gui():
                         </div>`;
                     }
                 }
+                
+                let sysTempHTML = `
+                <div class="bg-blue-50 dark:bg-blue-900/20 p-4 rounded-lg border border-blue-200 dark:border-blue-800 mb-4 shrink-0">
+                    <h3 class="text-sm font-black text-blue-700 dark:text-blue-400 uppercase tracking-widest mb-3 flex items-center gap-2">
+                        <span data-i18n="sys_temp_setup">Master Temperature Setup</span>
+                    </h3>
+                    <div class="flex flex-col gap-3">
+                        <div class="flex items-center justify-between">
+                            <span class="text-xs font-bold text-slate-600 dark:text-slate-300 uppercase">Master Sensor</span>
+                            <select id="sys-t-sensor" onchange="triggerSave()" class="w-40 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded py-1.5 px-2 text-xs font-bold focus:outline-none dark:text-black">
+                                ${tempOpts}
+                            </select>
+                        </div>
+                        <div class="flex items-center justify-between">
+                            <span class="text-xs font-bold text-slate-600 dark:text-slate-300 uppercase">AO Channel</span>
+                            <input type="number" id="sys-t-ch" onchange="triggerSave()" value="${configData.sys_temp.ch}" class="w-20 text-center bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded py-1.5 text-xs font-bold outline-none dark:text-white">
+                        </div>
+                        <div class="flex gap-2 mt-1">
+                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden bg-white dark:bg-slate-800">
+                                <span class="px-2 py-1.5 text-[10px] font-black text-slate-500 border-r border-slate-300 dark:border-slate-600">4mA (°C)</span>
+                                <input type="number" id="sys-t-min" onchange="triggerSave()" value="${configData.sys_temp.min}" class="w-full text-center bg-transparent text-xs font-bold outline-none dark:text-white">
+                            </div>
+                            <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden bg-white dark:bg-slate-800">
+                                <span class="px-2 py-1.5 text-[10px] font-black text-slate-500 border-r border-slate-300 dark:border-slate-600">20mA (°C)</span>
+                                <input type="number" id="sys-t-max" onchange="triggerSave()" value="${configData.sys_temp.max}" class="w-full text-center bg-transparent text-xs font-bold outline-none dark:text-white">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                `;
+
                 document.getElementById('eng-sensors').innerHTML = engHTML;
-                document.getElementById('eng-ao-scaling').innerHTML = aoHTML;
+                document.getElementById('eng-ao-scaling').innerHTML = sysTempHTML + aoHTML;
                 
                 isInitialized = true;
                 applyLang();
@@ -1829,6 +2058,29 @@ def get_gui():
 
                     if(currentTab === 'dash' || currentTab === 'trends') {
                         let sidebarHTML = '';
+                        
+                        if (configData.sys_temp && configData.sys_temp.sensor) {
+                            const masterName = configData.sensors[configData.sys_temp.sensor] ? configData.sensors[configData.sys_temp.sensor].label : '';
+                            sidebarHTML += `
+                            <div class="card p-4 rounded-lg flex flex-col gap-1 border border-blue-300 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 shrink-0 mb-2 shadow-sm">
+                                <div class="flex justify-between items-center mb-1 pb-2 border-b border-blue-200 dark:border-blue-800/50">
+                                    <span class="text-xs font-black text-blue-700 dark:text-blue-400 uppercase flex items-center gap-1.5">🌡️ <span data-i18n="sys_temp">SYS TEMP</span></span>
+                                    <span class="text-[10px] font-bold text-blue-500 dark:text-blue-400 truncate max-w-[100px] uppercase">${masterName}</span>
+                                </div>
+                                <div class="flex justify-between items-end mt-1">
+                                    <div class="flex items-baseline gap-1">
+                                        <span class="font-black text-slate-800 dark:text-white text-3xl tracking-tighter">${d.data.sys_temp || '--'}</span>
+                                        <span class="text-sm font-bold text-slate-500">°C</span>
+                                    </div>
+                                    <div class="text-right">
+                                        <span class="text-[10px] text-slate-500 font-bold block mb-0.5 uppercase tracking-widest">OUT (CH ${configData.sys_temp.ch}):</span>
+                                        <span class="font-mono text-blue-600 dark:text-blue-400 font-black text-base tracking-wider">${d.data.sys_temp_ao || '--'} <span class="text-[10px]">mA</span></span>
+                                    </div>
+                                </div>
+                            </div>
+                            `;
+                        }
+
                         const activeSensors = Object.entries(configData.sensors || {}).filter(([k, v]) => v.enabled);
                         
                         activeSensors.forEach(([key, s]) => {
