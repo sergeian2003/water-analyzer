@@ -130,14 +130,6 @@ def encode_dcba(val):
     packed = struct.pack('<f', float(val))
     return struct.unpack('>HH', packed)
 
-def decode_abcd(registers):
-    packed = struct.pack('>HH', registers[0], registers[1])
-    return struct.unpack('>f', packed)[0]
-
-def encode_abcd(val):
-    packed = struct.pack('>f', float(val))
-    return struct.unpack('>HH', packed)
-
 _shared_instr = None
 
 def create_instrument(sensor_id):
@@ -429,22 +421,41 @@ def modbus_worker():
         except Exception: pass
         time.sleep(0.5)
 
-def read_tail(filepath, lines=30):
+def read_tail(filepath, lines=30, start_date=None, end_date=None):
     if not os.path.exists(filepath): return {"headers": [], "rows": []}
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             all_rows = list(csv.reader(f))
             if len(all_rows) > 0:
-                return {"headers": all_rows[0], "rows": list(reversed(all_rows[1:][-lines:]))}
+                headers = all_rows[0]
+                data_rows = all_rows[1:]
+                
+                if start_date or end_date:
+                    filtered = []
+                    for r in data_rows:
+                        if not r or len(r) == 0: continue
+                        # Извлекаем "YYYY-MM-DD" из формата "YYYY-MM-DD HH:MM:SS"
+                        row_date = r[0].split(' ')[0] 
+                        if start_date and row_date < start_date: continue
+                        if end_date and row_date > end_date: continue
+                        filtered.append(r)
+                    # Ограничиваем вывод до 500 строк, чтобы UI не завис
+                    return {"headers": headers, "rows": list(reversed(filtered[-500:]))}
+                
+                return {"headers": headers, "rows": list(reversed(data_rows[-lines:]))}
     except: pass
     return {"headers": [], "rows": []}
 
 @app.get("/api/all")
-def get_all(): 
+def get_all(log_start: str = None, log_end: str = None): 
+    # Предотвращаем пустые строки от фронтенда
+    if log_start == "": log_start = None
+    if log_end == "": log_end = None
+    
     logs = {
-        "5min": read_tail(LOG_5MIN),
-        "1hr": read_tail(LOG_1HR),
-        "alarm": read_tail(LOG_ALARM, 50)
+        "5min": read_tail(LOG_5MIN, 30, log_start, log_end),
+        "1hr": read_tail(LOG_1HR, 30, log_start, log_end),
+        "alarm": read_tail(LOG_ALARM, 50, log_start, log_end)
     }
     return {"data": sensor_data, "history": history_data, "relays": relay_states, "config": config, "logs": logs}
 
@@ -751,12 +762,27 @@ def get_gui():
         </main>
 
         <main id="tab-logs" class="p-6 hidden flex-grow overflow-hidden flex flex-col min-h-0 gap-4">
-            <div class="flex justify-between items-center shrink-0">
+            <div class="flex justify-between items-center shrink-0 flex-wrap gap-4">
                 <div class="flex gap-2">
                     <button onclick="setLogView('5min')" id="btn-v-5min" class="log-tab-btn active px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400" data-i18n="log_5min">5-Min Data</button>
                     <button onclick="setLogView('1hr')" id="btn-v-1hr" class="log-tab-btn px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400" data-i18n="log_1hr">1-Hour AVG</button>
                     <button onclick="setLogView('alarm')" id="btn-v-alarm" class="log-tab-btn px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400" data-i18n="log_alarm">Alarm History</button>
                 </div>
+                
+                <div class="flex items-center gap-3 bg-white dark:bg-slate-800 p-2 rounded-lg border border-slate-300 dark:border-slate-700 shadow-sm">
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs font-bold text-slate-500 uppercase tracking-widest" data-i18n="start_date">Start Date</span>
+                        <input type="date" id="log-start-date" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded text-xs px-2 py-1.5 dark:text-white outline-none focus:border-cyan-500 font-bold text-slate-700">
+                    </div>
+                    <span class="text-slate-400 font-bold">-</span>
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs font-bold text-slate-500 uppercase tracking-widest" data-i18n="end_date">End Date</span>
+                        <input type="date" id="log-end-date" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded text-xs px-2 py-1.5 dark:text-white outline-none focus:border-cyan-500 font-bold text-slate-700">
+                    </div>
+                    <button onclick="applyLogFilter()" class="bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs px-4 py-1.5 rounded uppercase tracking-wider transition-colors shadow-sm ml-1" data-i18n="search">Search</button>
+                    <button onclick="clearLogFilter()" class="bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-white font-bold text-xs px-4 py-1.5 rounded uppercase tracking-wider transition-colors shadow-sm" data-i18n="clear">Clear</button>
+                </div>
+
                 <button id="btn-export" onclick="openExportModal()" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-6 py-2 rounded uppercase tracking-wider shadow-lg flex items-center gap-2 transition-colors border border-emerald-700">
                     <span data-i18n="export">Export to Desktop</span>
                 </button>
@@ -1119,6 +1145,10 @@ def get_gui():
             let isInitialized = false;
             let charts = [];
             
+            // Фильтры логов
+            let filterStartDate = '';
+            let filterEndDate = '';
+            
             const allowedUnits = {
                 "mlss": ["mg/L", "g/L", "ppm", "%", "NTU"],
                 "uv254": ["mg/L", "ppm"],
@@ -1148,7 +1178,8 @@ def get_gui():
                     opt_off: "OFF (No Cleaning)", opt_int: "INTERNAL (Sensor Wiper)", opt_ext: "EXTERNAL (KM6073 Relay)",
                     id_tool: "ID TOOL", id_tool_title: "CHANGE SENSOR ID", id_tool_warn: "⚠️ WARNING: Only ONE sensor must be connected to the bus!",
                     current_id: "CURRENT ID (255=Broadcast)", new_id: "NEW ID", change_id: "CHANGE ID", std_sensors: "Standard Sensors", mlss_sensor: "MLSS Sensor",
-                    sys_temp_setup: "Master Temperature Setup", sys_temp: "SYSTEM TEMP"
+                    sys_temp_setup: "Master Temperature Setup", sys_temp: "SYSTEM TEMP",
+                    start_date: "Start Date", end_date: "End Date", search: "Search", clear: "Clear"
                 },
                 ko: {
                     nav_dash: "대시보드", nav_trends: "트렌드", nav_logs: "로그", nav_ctrl: "제어", nav_setup: "설정", theme: "테마", exit: "종료",
@@ -1167,7 +1198,8 @@ def get_gui():
                     opt_off: "사용 안함 (OFF)", opt_int: "내부 와이퍼 (INTERNAL)", opt_ext: "외부 릴레이 (EXTERNAL)",
                     id_tool: "ID 변경 툴", id_tool_title: "센서 ID 변경", id_tool_warn: "⚠️ 주의: 통신선에 변경할 센서 1개만 연결하세요!",
                     current_id: "현재 ID (모를경우 255)", new_id: "새로운 ID", change_id: "ID 변경", std_sensors: "일반 센서 (pH, DO, ORP 등)", mlss_sensor: "MLSS 센서",
-                    sys_temp_setup: "시스템 온도 설정 (마스터)", sys_temp: "시스템 온도"
+                    sys_temp_setup: "시스템 온도 설정 (마스터)", sys_temp: "시스템 온도",
+                    start_date: "시작일", end_date: "종료일", search: "조회", clear: "초기화"
                 }
             };
 
@@ -1189,6 +1221,20 @@ def get_gui():
                 configData.lang = configData.lang === 'en' ? 'ko' : 'en';
                 applyLang();
                 triggerSave();
+            }
+            
+            function applyLogFilter() {
+                filterStartDate = document.getElementById('log-start-date').value;
+                filterEndDate = document.getElementById('log-end-date').value;
+                update(); 
+            }
+
+            function clearLogFilter() {
+                document.getElementById('log-start-date').value = '';
+                document.getElementById('log-end-date').value = '';
+                filterStartDate = '';
+                filterEndDate = '';
+                update();
             }
 
             function updateNewSensorUnits() {
@@ -2028,7 +2074,7 @@ def get_gui():
 
             async function update() {
                 try {
-                    const res = await fetch('/api/all');
+                    const res = await fetch(`/api/all?log_start=${filterStartDate}&log_end=${filterEndDate}`);
                     const d = await res.json();
                     
                     if(!isInitialized) { 
@@ -2039,11 +2085,9 @@ def get_gui():
                             themeInitialized = true;
                             if (configData.theme === 'light') {
                                 document.documentElement.classList.remove('dark');
-                                document.getElementById('theme-icon').innerHTML = iconMoon;
                                 isDark = false;
                             } else {
                                 document.documentElement.classList.add('dark');
-                                document.getElementById('theme-icon').innerHTML = iconSun;
                                 isDark = true;
                             }
                             updateChartColors();
@@ -2064,7 +2108,7 @@ def get_gui():
                             sidebarHTML += `
                             <div class="card p-4 rounded-lg flex flex-col gap-1 border border-blue-300 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 shrink-0 mb-2 shadow-sm">
                                 <div class="flex justify-between items-center mb-1 pb-2 border-b border-blue-200 dark:border-blue-800/50">
-                                    <span class="text-xs font-black text-blue-700 dark:text-blue-400 uppercase flex items-center gap-1.5">🌡️ <span data-i18n="sys_temp">SYS TEMP</span></span>
+                                    <span class="text-xs font-black text-blue-700 dark:text-blue-400 uppercase flex items-center gap-1.5"><span data-i18n="sys_temp">SYS TEMP</span></span>
                                     <span class="text-[10px] font-bold text-blue-500 dark:text-blue-400 truncate max-w-[100px] uppercase">${masterName}</span>
                                 </div>
                                 <div class="flex justify-between items-end mt-1">
