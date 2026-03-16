@@ -47,7 +47,19 @@ DEFAULT_CONFIG = {
     "admin_pwd": "1234",
     "relay_id": 8,
     "ao_id": 9,
+    "relay_name": "KM6063 Relay Module",
+    "ao_name": "KM6023 Analog Output",
     "sys_temp": {"sensor": "", "ch": 4, "min": 0, "max": 50},
+    "relays": {
+        "0": {"label": "Pump 1 (Inlet)", "enabled": True},
+        "1": {"label": "Pump 2 (Outlet)", "enabled": True},
+        "2": {"label": "Aerator", "enabled": True},
+        "3": {"label": "Drain Valve", "enabled": True},
+        "4": {"label": "Relay 5", "enabled": False},
+        "5": {"label": "Relay 6", "enabled": False},
+        "6": {"label": "Relay 7", "enabled": False},
+        "7": {"label": "Relay 8", "enabled": False}
+    },
     "sensors": {
         "s_1": {"id": 15, "type": "mlss", "enabled": True, "label": "MLSS", "color": "#94a3b8", "unit": "mg/L", "min": 0, "max": 10000, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel": 0},
         "s_2": {"id": 16, "type": "uv254", "enabled": True, "label": "UV254 (COD)", "color": "#3b82f6", "unit": "mg/L", "min": 0, "max": 100, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel": 0}
@@ -63,7 +75,13 @@ def load_config():
                 if "lang" not in cfg: cfg["lang"] = "en"
                 if "admin_pwd" not in cfg: cfg["admin_pwd"] = "1234"
                 if "ao_id" not in cfg: cfg["ao_id"] = 9
+                if "relay_name" not in cfg: cfg["relay_name"] = "KM6063 Relay Module"
+                if "ao_name" not in cfg: cfg["ao_name"] = "KM6023 Analog Output"
                 if "sys_temp" not in cfg: cfg["sys_temp"] = {"sensor": "", "ch": 4, "min": 0, "max": 50}
+                
+                if "relays" not in cfg:
+                    cfg["relays"] = DEFAULT_CONFIG["relays"]
+                
                 if "sensors" not in cfg: cfg["sensors"] = {} 
                 
                 for k, v in cfg.get("sensors", {}).items():
@@ -94,7 +112,8 @@ config = load_config()
 # --- 동적 데이터 엔진 ---
 sensor_data = {"sys_temp": "--", "sys_temp_ao": "0.00"}
 history_data = {}
-relay_states = [0, 0, 0, 0]
+relay_states = [0]*8
+ao_manual = {i: {"active": False, "val": 4.0} for i in range(8)}
 
 hourly_buffer = {}
 alarm_states = {}
@@ -243,6 +262,9 @@ def modbus_worker():
         all_keys = list(config.get("sensors", {}).keys())
         active_keys = [k for k in all_keys if config["sensors"][k].get("enabled")]
         
+        # 신규: 아날로그 출력 목표값을 모아둘 딕셔너리 (기본 4.0mA)
+        auto_ao_out = {0: 4.0, 1: 4.0, 2: 4.0, 3: 4.0}
+        
         try:
             sensors_cfg = list(config.get("sensors", {}).items())
             
@@ -333,17 +355,11 @@ def modbus_worker():
                         sensor_data[key]["ao"] = f"{ao_val:.2f}"
                         sensor_data[key]["status"] = "OK"
                         
-                    if key in active_keys:
-                        ch_index = active_keys.index(key) 
-                        if ch_index < 4: 
-                            try:
-                                ao_id = get_safe_int(config.get("ao_id", 9), 9)
-                                ao_int = int(ao_val * 1000) 
-                                with modbus_lock:
-                                    instr_ao = create_instrument(ao_id)
-                                    read_with_retry(instr_ao.write_register, ch_index, ao_int, 0, 6, retries=1)
-                            except Exception: 
-                                pass 
+                        # 자동 모드일 경우 값을 버퍼에 저장
+                        if key in active_keys:
+                            ch_index = active_keys.index(key) 
+                            if ch_index < 4: 
+                                auto_ao_out[ch_index] = ao_val
                             
                     if len(history_data[key]) > 0: history_data[key].pop(0)
                     history_data[key].append(val_num)
@@ -380,20 +396,33 @@ def modbus_worker():
                     sensor_data["sys_temp"] = f"{sys_t_val:.1f}"
                     sensor_data["sys_temp_ao"] = f"{t_ao:.2f}"
                     
-                    # Write to AO Module
                     t_ch = int(sys_t_cfg.get("ch", 4))
-                    ao_id = get_safe_int(config.get("ao_id", 9), 9)
-                    try:
-                        with modbus_lock:
-                            instr_ao = create_instrument(ao_id)
-                            read_with_retry(instr_ao.write_register, t_ch, int(t_ao * 1000), 0, 6, retries=1)
-                    except Exception: pass
+                    if t_ch < 4:
+                        auto_ao_out[t_ch] = t_ao
                 except Exception:
                     sensor_data["sys_temp"] = "--"
                     sensor_data["sys_temp_ao"] = "0.00"
             else:
                 sensor_data["sys_temp"] = "--"
                 sensor_data["sys_temp_ao"] = "0.00"
+
+            # === NEW CENTRALIZED AO WRITE BLOCK ===
+            # 통신 병목을 해결하기 위해, 수동/자동 여부를 판단하여 여기서 한 번만 전송합니다.
+            try:
+                ao_id = get_safe_int(config.get("ao_id", 9), 9)
+                with modbus_lock:
+                    instr_ao = create_instrument(ao_id)
+                    for c in range(4):
+                        if ao_manual.get(c, {}).get("active"):
+                            target_ao = ao_manual[c]["val"]
+                        else:
+                            target_ao = auto_ao_out[c]
+                        
+                        try:
+                            # 1초마다 지속적으로 값 푸시 (수동 모드 포함)
+                            read_with_retry(instr_ao.write_register, c, int(target_ao * 1000), 0, 6, retries=1)
+                        except: pass
+            except: pass
 
             # === LOGS WRITING ===
             if all_keys:
@@ -434,12 +463,10 @@ def read_tail(filepath, lines=30, start_date=None, end_date=None):
                     filtered = []
                     for r in data_rows:
                         if not r or len(r) == 0: continue
-                        # Извлекаем "YYYY-MM-DD" из формата "YYYY-MM-DD HH:MM:SS"
                         row_date = r[0].split(' ')[0] 
                         if start_date and row_date < start_date: continue
                         if end_date and row_date > end_date: continue
                         filtered.append(r)
-                    # Ограничиваем вывод до 500 строк, чтобы UI не завис
                     return {"headers": headers, "rows": list(reversed(filtered[-500:]))}
                 
                 return {"headers": headers, "rows": list(reversed(data_rows[-lines:]))}
@@ -448,7 +475,6 @@ def read_tail(filepath, lines=30, start_date=None, end_date=None):
 
 @app.get("/api/all")
 def get_all(log_start: str = None, log_end: str = None): 
-    # Предотвращаем пустые строки от фронтенда
     if log_start == "": log_start = None
     if log_end == "": log_end = None
     
@@ -457,7 +483,7 @@ def get_all(log_start: str = None, log_end: str = None):
         "1hr": read_tail(LOG_1HR, 30, log_start, log_end),
         "alarm": read_tail(LOG_ALARM, 50, log_start, log_end)
     }
-    return {"data": sensor_data, "history": history_data, "relays": relay_states, "config": config, "logs": logs}
+    return {"data": sensor_data, "history": history_data, "relays": relay_states, "ao_manual": ao_manual, "config": config, "logs": logs}
 
 @app.post("/api/save_config")
 async def update_cfg(request: Request):
@@ -488,6 +514,14 @@ def toggle_relay(ch: int, state: int):
             instr = create_instrument(r_id)
             read_with_retry(instr.write_bit, ch, state, 5, retries=2)
     except: pass
+    return {"status": "ok"}
+
+@app.get("/api/ao_manual")
+def set_ao_manual(ch: int, active: int, val: float):
+    # 이제 여기서 직접 모듈로 쏘지 않고, 백그라운드 워커가 딕셔너리 값만 가져가서 처리합니다.
+    if ch in ao_manual:
+        ao_manual[ch]["active"] = bool(active)
+        ao_manual[ch]["val"] = val
     return {"status": "ok"}
 
 @app.get("/api/trigger_clean")
@@ -610,8 +644,18 @@ def set_cal(sensor_id: int, s_type: str, k: float, b: float):
 def change_sensor_id(curr_id: int, new_id: int, s_type: str):
     try:
         with modbus_lock:
-            id_register = 25 if s_type == 'mlss' else 12288
             instr = create_instrument(curr_id)
+            
+            if s_type == 'io_module':
+                try:
+                    instr.write_register(0, new_id, 0, functioncode=6)
+                except minimalmodbus.IllegalRequestError:
+                    instr.write_registers(0, [new_id])
+                except Exception:
+                    pass
+                return {"status": "ok"}
+
+            id_register = 25 if s_type == 'mlss' else 12288
             
             try:
                 current_reg = instr.read_register(id_register, 0)
@@ -637,6 +681,33 @@ def change_sensor_id(curr_id: int, new_id: int, s_type: str):
                 pass 
                 
             return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/scan_io")
+def scan_io_module(module_type: str):
+    try:
+        known_sensors = [get_safe_int(s.get("id")) for s in config.get("sensors", {}).values()]
+        
+        if module_type == 'relay':
+            ignore_id = get_safe_int(config.get("ao_id", 9), 9)
+        else:
+            ignore_id = get_safe_int(config.get("relay_id", 8), 8)
+            
+        with modbus_lock:
+            for i in range(1, 100):
+                if i in known_sensors or i == ignore_id: 
+                    continue
+                
+                instr = create_instrument(i)
+                instr.serial.timeout = 0.05  
+                
+                try:
+                    instr.read_register(0, 0, 3)
+                    return {"status": "ok", "id": i}
+                except: pass
+                    
+        return {"status": "error", "message": "Module not found on bus"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -795,21 +866,38 @@ def get_gui():
             </div>
         </main>
 
-        <main id="tab-ctrl" class="p-6 hidden flex-grow flex items-center justify-center min-h-0">
-            <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-8 w-full max-w-3xl border-t-4 border-t-cyan-500 dark:border-t-cyan-900/30">
+        <main id="tab-ctrl" class="p-6 hidden flex-grow flex flex-col gap-6 items-center min-h-0 overflow-y-auto">
+            <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-8 w-full max-w-4xl border-t-4 border-t-cyan-500 dark:border-t-cyan-900/30 shrink-0">
                 <h2 class="text-cyan-600 dark:text-cyan-400 font-black text-xl mb-6 uppercase border-b border-slate-300 dark:border-slate-700 pb-4" data-i18n="manual_or">Manual Relay Override</h2>
+                <div id="ctrl-relay-grid" class="grid grid-cols-2 gap-8">
+                    </div>
+            </div>
+
+            <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-8 w-full max-w-4xl border-t-4 border-t-fuchsia-500 dark:border-t-fuchsia-900/30 shrink-0 mb-8">
+                <h2 class="text-fuchsia-600 dark:text-fuchsia-400 font-black text-xl mb-6 uppercase border-b border-slate-300 dark:border-slate-700 pb-4" data-i18n="manual_ao">Manual Analog Output</h2>
                 <div class="grid grid-cols-2 gap-8">
                     <script>
-                        ['Pump 1 (Inlet)', 'Pump 2 (Outlet)', 'Aerator', 'Drain Valve'].forEach((name, i) => {
+                        for(let i=0; i<4; i++) {
                             document.write(`
-                            <div class="flex items-center justify-between bg-slate-100 dark:bg-slate-800/40 p-5 rounded-xl border border-slate-300 dark:border-slate-700/50">
-                                <span class="text-sm font-bold text-slate-700 dark:text-slate-300 uppercase" data-i18n="relay_${i}">${name}</span>
-                                <label class="relative inline-flex items-center cursor-pointer">
-                                    <input type="checkbox" id="relay-${i}" onchange="fetch('/api/relay?ch=${i}&state='+(this.checked?1:0))" class="sr-only peer">
-                                    <div class="w-14 h-7 bg-slate-300 dark:bg-slate-900 rounded-full border border-slate-400 dark:border-slate-600 peer-checked:bg-cyan-500 transition-colors after:content-[''] after:absolute after:top-[3px] after:left-[3px] after:bg-white dark:after:bg-slate-400 after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-[28px] peer-checked:after:bg-white"></div>
-                                </label>
-                            </div>`);
-                        });
+                            <div class="flex flex-col bg-slate-100 dark:bg-slate-800/40 p-5 rounded-xl border border-slate-300 dark:border-slate-700/50 shadow-sm gap-4">
+                                <div class="flex items-center justify-between">
+                                    <span class="text-sm font-bold text-slate-700 dark:text-slate-300 uppercase">AO CH ${i}</span>
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-[10px] font-black text-slate-400 uppercase tracking-widest">AUTO</span>
+                                        <label class="relative inline-flex items-center cursor-pointer">
+                                            <input type="checkbox" id="ao-toggle-${i}" onchange="updateAoManual(${i})" class="sr-only peer">
+                                            <div class="w-10 h-5 bg-slate-300 dark:bg-slate-700 rounded-full peer-checked:bg-fuchsia-500 transition-colors after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-[20px]"></div>
+                                        </label>
+                                        <span class="text-[10px] font-black text-fuchsia-500 uppercase tracking-widest">MANUAL</span>
+                                    </div>
+                                </div>
+                                <div class="flex items-center gap-3 opacity-50 pointer-events-none transition-opacity" id="ao-ctrl-box-${i}">
+                                    <input type="range" id="ao-slider-${i}" min="4" max="20" step="0.1" value="4.0" oninput="document.getElementById('ao-val-${i}').innerText = parseFloat(this.value).toFixed(1); updateAoManual(${i})" class="flex-1 accent-fuchsia-500">
+                                    <div class="w-16 text-right font-mono font-black text-fuchsia-600 dark:text-fuchsia-400"><span id="ao-val-${i}">4.0</span> mA</div>
+                                </div>
+                            </div>
+                            `);
+                        }
                     </script>
                 </div>
             </div>
@@ -842,12 +930,19 @@ def get_gui():
                 <div id="eng-sensors" class="grid grid-cols-2 gap-4 mt-2 overflow-y-auto pr-2 flex-grow min-h-0 content-start"></div>
             </div>
             
-            <div class="flex flex-col gap-6 w-1/3 min-h-0">
-                <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-6 flex flex-col gap-4 flex-grow min-h-0">
+            <div class="flex flex-col gap-6 w-1/3 min-h-0 overflow-y-auto pr-1">
+                <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-6 flex flex-col gap-4 shrink-0">
                     <div class="border-b border-slate-300 dark:border-slate-700 pb-3 flex justify-between items-end shrink-0">
                         <h2 class="text-emerald-600 dark:text-emerald-500 font-black text-base uppercase" data-i18n="ao_scaling">4-20mA Scaling</h2>
                     </div>
-                    <div id="eng-ao-scaling" class="overflow-y-auto pr-2 flex-grow min-h-0 content-start flex flex-col gap-3"></div>
+                    <div id="eng-ao-scaling" class="flex flex-col gap-3"></div>
+                </div>
+                
+                <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-6 flex flex-col gap-4 shrink-0">
+                    <div class="border-b border-slate-300 dark:border-slate-700 pb-3 flex justify-between items-end shrink-0">
+                        <h2 class="text-purple-600 dark:text-purple-500 font-black text-base uppercase" data-i18n="relay_setup">Relay Configuration</h2>
+                    </div>
+                    <div id="eng-relays-list" class="flex flex-col gap-2"></div>
                 </div>
             </div>
         </main>
@@ -876,22 +971,41 @@ def get_gui():
             <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[400px] p-6 shadow-2xl flex flex-col">
                 <h2 class="text-slate-700 dark:text-slate-300 font-black text-xl mb-4 shrink-0 uppercase border-b border-slate-200 dark:border-slate-800 pb-3" data-i18n="io_setup">I/O Modules Setup</h2>
                 <div class="flex flex-col gap-4">
+                    
                     <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700">
-                        <label class="block text-xs font-black text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-widest" data-i18n="relay_module_id">Relay Module (KM6073) ID</label>
+                        <div class="flex justify-between items-end mb-3">
+                            <div class="flex flex-col">
+                                <span class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-0.5" data-i18n="relay_module_title">RELAY MODULE</span>
+                                <input type="text" id="eng-relay-name" onchange="triggerSave()" class="text-xs font-black text-slate-700 dark:text-slate-300 uppercase tracking-widest bg-transparent border-b border-slate-300 dark:border-slate-600 hover:border-indigo-400 focus:border-indigo-500 outline-none w-48 pb-1">
+                            </div>
+                            <button id="btn-scan-relay" onclick="autoDetectIo('relay', 'eng-relay-id', 'btn-scan-relay')" class="px-3 py-1.5 bg-indigo-100 text-indigo-600 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-400 rounded text-[10px] font-black uppercase tracking-wider transition-colors border border-indigo-200 dark:border-indigo-800">
+                                AUTO DETECT
+                            </button>
+                        </div>
                         <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
                             <button onclick="stepVal('eng-relay-id', -1)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
                             <input onchange="triggerSave()" type="number" id="eng-relay-id" class="w-full bg-transparent text-center py-2 text-slate-900 dark:text-white text-lg font-bold outline-none">
                             <button onclick="stepVal('eng-relay-id', 1)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                         </div>
                     </div>
+                    
                     <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700">
-                        <label class="block text-xs font-black text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-widest" data-i18n="ao_module_id">Analog Output (KM6023) ID</label>
+                        <div class="flex justify-between items-end mb-3">
+                            <div class="flex flex-col">
+                                <span class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-0.5" data-i18n="ao_module_title">ANALOG OUTPUT</span>
+                                <input type="text" id="eng-ao-name" onchange="triggerSave()" class="text-xs font-black text-slate-700 dark:text-slate-300 uppercase tracking-widest bg-transparent border-b border-slate-300 dark:border-slate-600 hover:border-indigo-400 focus:border-indigo-500 outline-none w-48 pb-1">
+                            </div>
+                            <button id="btn-scan-ao" onclick="autoDetectIo('ao', 'eng-ao-id', 'btn-scan-ao')" class="px-3 py-1.5 bg-indigo-100 text-indigo-600 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-400 rounded text-[10px] font-black uppercase tracking-wider transition-colors border border-indigo-200 dark:border-indigo-800">
+                                AUTO DETECT
+                            </button>
+                        </div>
                         <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
                             <button onclick="stepVal('eng-ao-id', -1)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
                             <input onchange="triggerSave()" type="number" id="eng-ao-id" class="w-full bg-transparent text-center py-2 text-slate-900 dark:text-white text-lg font-bold outline-none">
                             <button onclick="stepVal('eng-ao-id', 1)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                         </div>
                     </div>
+                    
                 </div>
                 <div class="flex justify-end gap-3 mt-6">
                     <button onclick="closeIoModal()" class="px-6 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm" data-i18n="close">CLOSE</button>
@@ -946,7 +1060,7 @@ def get_gui():
                     <h2 class="text-blue-600 dark:text-blue-400 font-black text-xl uppercase tracking-wider" data-i18n="id_tool_title">CHANGE SENSOR ID</h2>
                 </div>
                 <p class="text-[11px] font-bold text-rose-600 dark:text-rose-400 mb-5 bg-rose-50 dark:bg-rose-950/30 p-2 rounded border border-rose-200 dark:border-rose-900/50" data-i18n="id_tool_warn">
-                    ⚠️ WARNING: Only ONE sensor must be connected to the RS485 bus during this operation!
+                    [WARNING] Only ONE device must be connected to the bus!
                 </p>
                 
                 <div class="space-y-4">
@@ -955,6 +1069,7 @@ def get_gui():
                         <select id="tool-s-type" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2 text-slate-900 dark:text-black font-bold text-sm focus:outline-none focus:border-blue-500">
                             <option value="std" data-i18n="std_sensors">Standard (pH, DO, ORP, etc.)</option>
                             <option value="mlss" data-i18n="mlss_sensor">MLSS Sensor</option>
+                            <option value="io_module" data-i18n="io_module_type">I/O Module (KM60xx Relay/AO)</option>
                         </select>
                     </div>
                     <div>
@@ -1095,7 +1210,7 @@ def get_gui():
                         <select id="clean-mode" onchange="updateCleanUI(); triggerSave();" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-black font-bold text-sm focus:outline-none focus:border-sky-500">
                             <option value="off" data-i18n="opt_off">OFF (No Cleaning)</option>
                             <option value="internal" data-i18n="opt_int">INTERNAL (Sensor Wiper)</option>
-                            <option value="external" data-i18n="opt_ext">EXTERNAL (KM6073 Relay)</option>
+                            <option value="external" data-i18n="opt_ext">EXTERNAL (Relay)</option>
                         </select>
                     </div>
                     
@@ -1118,13 +1233,9 @@ def get_gui():
                     </div>
 
                     <div id="clean-rel-block" class="hidden">
-                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest" data-i18n="relay_channel">KM6073 Relay Channel</label>
+                        <label class="block text-sm font-bold text-slate-500 dark:text-slate-400 mb-1.5 uppercase tracking-widest" data-i18n="relay_channel">Relay Channel</label>
                         <select id="clean-rel" onchange="triggerSave()" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2.5 text-slate-900 dark:text-black font-bold text-sm focus:outline-none focus:border-sky-500">
-                            <option value="0">CH 0 (Pump 1)</option>
-                            <option value="1">CH 1 (Pump 2)</option>
-                            <option value="2">CH 2 (Aerator)</option>
-                            <option value="3">CH 3 (Drain Valve)</option>
-                        </select>
+                            </select>
                     </div>
                 </div>
                 
@@ -1145,7 +1256,6 @@ def get_gui():
             let isInitialized = false;
             let charts = [];
             
-            // Фильтры логов
             let filterStartDate = '';
             let filterEndDate = '';
             
@@ -1165,41 +1275,43 @@ def get_gui():
                     nav_dash: "Dashboard", nav_trends: "Trends", nav_logs: "Logs", nav_ctrl: "Control", nav_setup: "Setup", theme: "Theme", exit: "EXIT",
                     sys_status: "System Status", mini_trend: "MINI TREND", multi_trend: "MULTI-TREND ANALYSIS", show_all: "SHOW ALL LINES",
                     log_5min: "5-Min Data", log_1hr: "1-Hour AVG", log_alarm: "Alarm History", export: "Export to Desktop",
-                    manual_or: "Manual Relay Override", relay_0: "Pump 1 (Inlet)", relay_1: "Pump 2 (Outlet)", relay_2: "Aerator", relay_3: "Drain Valve",
-                    dev_net: "Device Network Manager", io_setup: "I/O SETUP", add_sensor: "ADD SENSOR", change_pwd: "CHANGE PWD", ao_scaling: "4-20mA Scaling",
+                    manual_or: "Manual Relay Override",
+                    dev_net: "Device Network Manager", io_setup: "I/O SETUP", add_sensor: "ADD SENSOR", change_pwd: "CHANGE PWD", ao_scaling: "4-20mA Scaling", relay_setup: "Relay Configuration",
                     export_title: "Advanced Data Export", export_dates: "1. Select Dates", export_sensors: "2. Select Sensors", cancel: "CANCEL", download_csv: "DOWNLOAD CSV",
                     admin_login: "Admin Login", password: "PASSWORD", unlock: "UNLOCK", new_pwd: "NEW PASSWORD", save: "SAVE", close: "CLOSE", lock: "LOCK",
                     sw_cal: "1. HMI Software (y = A*x + B)", hw_cal: "2. Sensor Hardware (Modbus)", save_hw_cal: "SAVE HW CAL",
                     clean_title: "CLEANING SETUP", ctrl_mode: "Control Mode", test_now: "TEST NOW",
                     btn_cal: "CALIBRATION", btn_clean: "CLEANING", cal_title: "CALIBRATION",
                     sensor_type: "SENSOR TYPE", unit_label: "UNIT", modbus_id: "MODBUS ID (1-247)", display_label: "DISPLAY LABEL", chart_color: "CHART COLOR",
-                    relay_module_id: "Relay Module (KM6073) ID", ao_module_id: "Analog Output (KM6023) ID",
-                    interval_min: "Interval (Minutes)", duration_sec: "Duration (Seconds)", relay_channel: "KM6073 Relay Channel",
-                    opt_off: "OFF (No Cleaning)", opt_int: "INTERNAL (Sensor Wiper)", opt_ext: "EXTERNAL (KM6073 Relay)",
-                    id_tool: "ID TOOL", id_tool_title: "CHANGE SENSOR ID", id_tool_warn: "⚠️ WARNING: Only ONE sensor must be connected to the bus!",
+                    relay_module_title: "RELAY MODULE", ao_module_title: "ANALOG OUTPUT",
+                    interval_min: "Interval (Minutes)", duration_sec: "Duration (Seconds)", relay_channel: "Relay Channel",
+                    opt_off: "OFF (No Cleaning)", opt_int: "INTERNAL (Sensor Wiper)", opt_ext: "EXTERNAL (Relay)",
+                    id_tool: "ID TOOL", id_tool_title: "CHANGE SENSOR ID", id_tool_warn: "[WARNING] Only ONE device must be connected to the bus!",
                     current_id: "CURRENT ID (255=Broadcast)", new_id: "NEW ID", change_id: "CHANGE ID", std_sensors: "Standard Sensors", mlss_sensor: "MLSS Sensor",
                     sys_temp_setup: "Master Temperature Setup", sys_temp: "SYSTEM TEMP",
-                    start_date: "Start Date", end_date: "End Date", search: "Search", clear: "Clear"
+                    start_date: "Start Date", end_date: "End Date", search: "Search", clear: "Clear", no_relays: "No active relays",
+                    io_module_type: "I/O Module (KM60xx Relay/AO)", manual_ao: "Manual Analog Output"
                 },
                 ko: {
                     nav_dash: "대시보드", nav_trends: "트렌드", nav_logs: "로그", nav_ctrl: "제어", nav_setup: "설정", theme: "테마", exit: "종료",
                     sys_status: "시스템 상태", mini_trend: "미니 트렌드", multi_trend: "다중 트렌드 분석", show_all: "모든 라인 보기",
                     log_5min: "5분 데이터", log_1hr: "1시간 평균", log_alarm: "알람 이력", export: "바탕화면 저장",
-                    manual_or: "수동 릴레이 제어", relay_0: "펌프 1 (흡입)", relay_1: "펌프 2 (배출)", relay_2: "폭기장치", relay_3: "배수 밸브",
-                    dev_net: "장치 네트워크 관리", io_setup: "I/O 설정", add_sensor: "센서 추가", change_pwd: "비밀번호 변경", ao_scaling: "4-20mA 스케일링",
+                    manual_or: "수동 릴레이 제어",
+                    dev_net: "장치 네트워크 관리", io_setup: "I/O 설정", add_sensor: "센서 추가", change_pwd: "비밀번호 변경", ao_scaling: "4-20mA 스케일링", relay_setup: "릴레이 채널 설정",
                     export_title: "데이터 추출", export_dates: "1. 날짜 선택", export_sensors: "2. 센서 선택", cancel: "취소", download_csv: "CSV 다운로드",
                     admin_login: "관리자 로그인", password: "비밀번호", unlock: "잠금해제", new_pwd: "새 비밀번호", save: "저장", close: "닫기", lock: "잠금",
                     sw_cal: "1. HMI 소프트웨어 (y = A*x + B)", hw_cal: "2. 센서 하드웨어 (모드버스)", save_hw_cal: "하드웨어 저장",
                     clean_title: "세정(Cleaning) 설정", ctrl_mode: "제어 모드", test_now: "지금 테스트",
                     btn_cal: "교정 (CAL)", btn_clean: "세정 (CLEAN)", cal_title: "센서 교정",
                     sensor_type: "센서 종류", unit_label: "단위", modbus_id: "모드버스 ID (1-247)", display_label: "표시 이름", chart_color: "차트 색상",
-                    relay_module_id: "릴레이 모듈 (KM6073) ID", ao_module_id: "아날로그 출력 (KM6023) ID",
-                    interval_min: "작동 주기 (분)", duration_sec: "작동 시간 (초)", relay_channel: "KM6073 릴레이 채널",
+                    relay_module_title: "릴레이 모듈", ao_module_title: "아날로그 출력",
+                    interval_min: "작동 주기 (분)", duration_sec: "작동 시간 (초)", relay_channel: "릴레이 채널",
                     opt_off: "사용 안함 (OFF)", opt_int: "내부 와이퍼 (INTERNAL)", opt_ext: "외부 릴레이 (EXTERNAL)",
-                    id_tool: "ID 변경 툴", id_tool_title: "센서 ID 변경", id_tool_warn: "⚠️ 주의: 통신선에 변경할 센서 1개만 연결하세요!",
+                    id_tool: "ID 변경 툴", id_tool_title: "센서 ID 변경", id_tool_warn: "[주의] 통신선에 변경할 장치 1개만 연결하세요!",
                     current_id: "현재 ID (모를경우 255)", new_id: "새로운 ID", change_id: "ID 변경", std_sensors: "일반 센서 (pH, DO, ORP 등)", mlss_sensor: "MLSS 센서",
                     sys_temp_setup: "시스템 온도 설정 (마스터)", sys_temp: "시스템 온도",
-                    start_date: "시작일", end_date: "종료일", search: "조회", clear: "초기화"
+                    start_date: "시작일", end_date: "종료일", search: "조회", clear: "초기화", no_relays: "활성화된 릴레이가 없습니다",
+                    io_module_type: "I/O 모듈 (KM60xx 릴레이/AO)", manual_ao: "수동 아날로그 출력 테스트"
                 }
             };
 
@@ -1246,11 +1358,17 @@ def get_gui():
             async function triggerSave() {
                 if(!configData) return;
                 if(!configData.sensors) configData.sensors = {};
+                if(!configData.relays) configData.relays = {};
                 
                 const relayEl = document.getElementById('eng-relay-id');
                 if(relayEl) configData.relay_id = parseInt(relayEl.value) || 0;
                 const aoEl = document.getElementById('eng-ao-id');
                 if(aoEl) configData.ao_id = parseInt(aoEl.value) || 0;
+                
+                const relayNameEl = document.getElementById('eng-relay-name');
+                if(relayNameEl) configData.relay_name = relayNameEl.value;
+                const aoNameEl = document.getElementById('eng-ao-name');
+                if(aoNameEl) configData.ao_name = aoNameEl.value;
                 
                 if(document.getElementById('sys-t-sensor')) {
                     configData.sys_temp.sensor = document.getElementById('sys-t-sensor').value;
@@ -1260,6 +1378,19 @@ def get_gui():
                 }
                 
                 let needsRedraw = false;
+
+                for(let i=0; i<8; i++) {
+                    const enEl = document.getElementById('rel-en-'+i);
+                    const lblEl = document.getElementById('rel-lbl-'+i);
+                    if(enEl && lblEl) {
+                        if(!configData.relays[i]) configData.relays[i] = {};
+                        if (configData.relays[i].enabled !== enEl.checked || configData.relays[i].label !== lblEl.value) {
+                            configData.relays[i].enabled = enEl.checked;
+                            configData.relays[i].label = lblEl.value;
+                            needsRedraw = true;
+                        }
+                    }
+                }
 
                 for(const key of Object.keys(configData.sensors)) {
                     const idEl = document.getElementById('id-' + key);
@@ -1331,6 +1462,20 @@ def get_gui():
                 if(id.startsWith('id-') || id.startsWith('min-') || id.startsWith('max-') || id.startsWith('sys-') || id === 'eng-relay-id' || id === 'eng-ao-id' || id.startsWith('clean-') || id.startsWith('cal-soft-')) {
                     triggerSave();
                 }
+            }
+
+            function updateAoManual(ch) {
+                const isActive = document.getElementById('ao-toggle-' + ch).checked;
+                const box = document.getElementById('ao-ctrl-box-' + ch);
+                const val = parseFloat(document.getElementById('ao-slider-' + ch).value);
+                
+                if (isActive) {
+                    box.classList.remove('opacity-50', 'pointer-events-none');
+                } else {
+                    box.classList.add('opacity-50', 'pointer-events-none');
+                }
+                
+                fetch(`/api/ao_manual?ch=${ch}&active=${isActive ? 1 : 0}&val=${val}`);
             }
 
             let isAdmin = false;
@@ -1413,6 +1558,8 @@ def get_gui():
             function openIoModal() {
                 document.getElementById('eng-relay-id').value = configData.relay_id;
                 document.getElementById('eng-ao-id').value = configData.ao_id;
+                document.getElementById('eng-relay-name').value = configData.relay_name || 'KM6063 Relay Module';
+                document.getElementById('eng-ao-name').value = configData.ao_name || 'KM6023 Analog Output';
                 document.getElementById('io-modal-overlay').classList.remove('hidden');
             }
             function closeIoModal() { document.getElementById('io-modal-overlay').classList.add('hidden'); }
@@ -1479,14 +1626,14 @@ def get_gui():
             async function openExportModal() {
                 const btn = document.getElementById('btn-export');
                 const origHTML = btn.innerHTML;
-                btn.innerHTML = "⏳ LOADING...";
+                btn.innerHTML = "LOADING...";
                 
                 try {
                     const res = await fetch('/api/export_options?type=' + currentLogView);
                     const data = await res.json();
                     
                     if (data.status !== 'ok' || data.dates.length === 0) {
-                        btn.innerHTML = "❌ NO DATA YET";
+                        btn.innerHTML = "NO DATA YET";
                         btn.classList.add('bg-rose-600', 'border-rose-700');
                         btn.classList.remove('bg-emerald-600', 'border-emerald-700', 'hover:bg-emerald-500');
                         setTimeout(() => { 
@@ -1520,7 +1667,7 @@ def get_gui():
                     
                     document.getElementById('export-modal-overlay').classList.remove('hidden');
                 } catch (e) {
-                    btn.innerHTML = "❌ ERROR";
+                    btn.innerHTML = "ERROR";
                     btn.classList.add('bg-rose-600', 'border-rose-700');
                     btn.classList.remove('bg-emerald-600', 'border-emerald-700', 'hover:bg-emerald-500');
                     setTimeout(() => { 
@@ -1546,13 +1693,13 @@ def get_gui():
                 const origText = btn.innerText;
 
                 if (selectedDates.length === 0 || selectedCols.length === 0) {
-                    btn.innerText = "❌ SELECT OPTIONS";
+                    btn.innerText = "SELECT OPTIONS";
                     btn.classList.replace('bg-emerald-600', 'bg-rose-600');
                     setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-emerald-600'); }, 2000);
                     return;
                 }
                 
-                btn.innerText = "⏳ SAVING...";
+                btn.innerText = "SAVING...";
                 
                 try {
                     const res = await fetch('/api/export_execute', {
@@ -1563,16 +1710,16 @@ def get_gui():
                     const data = await res.json();
                     
                     if (data.status === 'ok') {
-                        btn.innerText = "✅ SAVED TO DESKTOP";
+                        btn.innerText = "SAVED TO DESKTOP";
                         btn.classList.replace('bg-emerald-600', 'bg-cyan-600');
                         setTimeout(() => { closeExportModal(); btn.innerText = origText; btn.classList.replace('bg-cyan-600', 'bg-emerald-600'); }, 1500);
                     } else {
-                        btn.innerText = "❌ FAILED";
+                        btn.innerText = "FAILED";
                         btn.classList.replace('bg-emerald-600', 'bg-rose-600');
                         setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-emerald-600'); }, 2000);
                     }
                 } catch (e) {
-                    btn.innerText = "❌ ERROR";
+                    btn.innerText = "ERROR";
                     btn.classList.replace('bg-emerald-600', 'bg-rose-600');
                     setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-emerald-600'); }, 2000);
                 }
@@ -1610,14 +1757,14 @@ def get_gui():
 
                 const btn = document.getElementById('btn-exec-id');
                 const origText = btn.innerText;
-                btn.innerText = "⏳ PROCESSING...";
+                btn.innerText = "PROCESSING...";
                 
                 try {
                     const res = await fetch(`/api/change_sensor_id?curr_id=${currId}&new_id=${newId}&s_type=${sType}`);
                     const data = await res.json();
                     
                     if (data.status === 'ok') {
-                        btn.innerText = "✅ SUCCESS";
+                        btn.innerText = "SUCCESS";
                         btn.classList.replace('bg-blue-600', 'bg-emerald-600');
                         setTimeout(() => { 
                             closeIdTool(); 
@@ -1626,13 +1773,13 @@ def get_gui():
                             alert(configData.lang === 'ko' ? "ID가 변경되었습니다! 센서의 전원을 껐다 켜주세요." : "ID changed! Please reboot the sensor (power off/on).");
                         }, 1000);
                     } else {
-                        btn.innerText = "❌ FAILED";
+                        btn.innerText = "FAILED";
                         btn.classList.replace('bg-blue-600', 'bg-rose-600');
                         setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-blue-600'); }, 2000);
                         alert("Error: " + data.message);
                     }
                 } catch(e) {
-                    btn.innerText = "❌ ERROR";
+                    btn.innerText = "ERROR";
                     btn.classList.replace('bg-blue-600', 'bg-rose-600');
                     setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-blue-600'); }, 2000);
                 }
@@ -1716,7 +1863,7 @@ def get_gui():
                     const res = await fetch(`/api/set_cal?sensor_id=${id}&s_type=${type}&k=${hwK}&b=${hwB}`);
                     const data = await res.json();
                     if (data.status === 'ok') {
-                        btn.innerText = "✅ SAVED";
+                        btn.innerText = "SAVED";
                         btn.classList.replace('bg-indigo-600', 'bg-emerald-600');
                         btn.classList.replace('border-indigo-700', 'border-emerald-700');
                         setTimeout(() => { 
@@ -1726,12 +1873,12 @@ def get_gui():
                             btn.classList.replace('border-emerald-700', 'border-indigo-700');
                         }, 1200);
                     } else {
-                        btn.innerText = "❌ HW FAILED";
+                        btn.innerText = "HW FAILED";
                         btn.classList.replace('bg-indigo-600', 'bg-rose-600');
                         setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-indigo-600'); }, 2000);
                     }
                 } catch(e) {
-                    btn.innerText = "❌ HW FAILED";
+                    btn.innerText = "HW FAILED";
                     btn.classList.replace('bg-indigo-600', 'bg-rose-600');
                     setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-indigo-600'); }, 2000);
                 }
@@ -1748,6 +1895,17 @@ def get_gui():
                 document.getElementById('clean-mode').value = s.c_mode || 'off';
                 document.getElementById('clean-int').value = s.c_int !== undefined ? s.c_int : 30;
                 document.getElementById('clean-dur').value = s.c_dur !== undefined ? s.c_dur : 10;
+                
+                const relSelect = document.getElementById('clean-rel');
+                relSelect.innerHTML = '';
+                for(let i=0; i<8; i++) {
+                    const r = configData.relays[i];
+                    if(r && r.enabled) {
+                        relSelect.innerHTML += `<option value="${i}">CH ${i} - ${r.label}</option>`;
+                    }
+                }
+                if(relSelect.innerHTML === '') relSelect.innerHTML = '<option value="0">No Relays Enabled</option>';
+                
                 document.getElementById('clean-rel').value = s.c_rel !== undefined ? s.c_rel : 0;
                 
                 updateCleanUI();
@@ -1787,7 +1945,7 @@ def get_gui():
                 const origHTML = btn.innerHTML;
                 const origClasses = btn.className;
                 
-                btn.innerHTML = "⏳ RUNNING...";
+                btn.innerHTML = "RUNNING...";
                 btn.className = "flex items-center px-4 py-2 bg-sky-500 text-white font-bold rounded text-xs shadow transition-colors";
 
                 await triggerSave();
@@ -1797,14 +1955,14 @@ def get_gui():
                     const data = await res.json();
                     
                     if (data.status === 'ok') {
-                        btn.innerHTML = "✅ TRIGGERED";
+                        btn.innerHTML = "TRIGGERED";
                         btn.classList.replace('bg-sky-500', 'bg-emerald-500');
                     } else {
-                        btn.innerHTML = "❌ FAILED";
+                        btn.innerHTML = "FAILED";
                         btn.classList.replace('bg-sky-500', 'bg-rose-500');
                     }
                 } catch(e) {
-                    btn.innerHTML = "❌ ERROR";
+                    btn.innerHTML = "ERROR";
                     btn.classList.replace('bg-sky-500', 'bg-rose-500');
                 }
                 
@@ -1952,7 +2110,6 @@ def get_gui():
 
                 let engHTML = '';
                 let aoHTML = '';
-                
                 let tempOpts = `<option value="">-- Select --</option>`;
 
                 for(const [key, s] of Object.entries(configData.sensors)) {
@@ -2064,8 +2221,41 @@ def get_gui():
                 </div>
                 `;
 
+                let relaysEngHTML = '';
+                for(let i=0; i<8; i++) {
+                    const r = configData.relays[i] || {label: 'CH ' + i, enabled: false};
+                    relaysEngHTML += `
+                    <div class="flex items-center gap-3 bg-slate-50 dark:bg-slate-800/50 p-2.5 rounded border border-slate-200 dark:border-slate-700">
+                        <span class="text-[10px] font-black text-slate-500 w-8 text-center shrink-0 uppercase">CH ${i}</span>
+                        <label class="relative inline-flex items-center cursor-pointer shrink-0">
+                            <input type="checkbox" id="rel-en-${i}" onchange="triggerSave()" ${r.enabled ? 'checked' : ''} class="sr-only peer">
+                            <div class="w-9 h-5 bg-slate-300 dark:bg-slate-600 rounded-full peer-checked:bg-purple-500 after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-[16px]"></div>
+                        </label>
+                        <input type="text" id="rel-lbl-${i}" onchange="triggerSave()" value="${r.label}" class="flex-1 bg-transparent text-sm font-bold outline-none text-slate-800 dark:text-white border-b border-transparent focus:border-purple-500 transition-colors px-1" placeholder="Relay Name">
+                    </div>`;
+                }
+
+                let ctrlHTML = '';
+                for(let i=0; i<8; i++) {
+                    const r = configData.relays[i];
+                    if(r && r.enabled) {
+                        ctrlHTML += `
+                        <div class="flex items-center justify-between bg-slate-100 dark:bg-slate-800/40 p-5 rounded-xl border border-slate-300 dark:border-slate-700/50 shadow-sm">
+                            <span class="text-sm font-bold text-slate-700 dark:text-slate-300 uppercase truncate pr-4">${r.label}</span>
+                            <label class="relative inline-flex items-center cursor-pointer shrink-0">
+                                <input type="checkbox" id="relay-toggle-${i}" onchange="fetch('/api/relay?ch=${i}&state='+(this.checked?1:0))" class="sr-only peer">
+                                <div class="w-14 h-7 bg-slate-300 dark:bg-slate-900 rounded-full border border-slate-400 dark:border-slate-600 peer-checked:bg-cyan-500 transition-colors after:content-[''] after:absolute after:top-[3px] after:left-[3px] after:bg-white dark:after:bg-slate-400 after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-[28px] peer-checked:after:bg-white"></div>
+                            </label>
+                        </div>`;
+                    }
+                }
+                
+                const ctrlGrid = document.getElementById('ctrl-relay-grid');
+                if(ctrlGrid) ctrlGrid.innerHTML = ctrlHTML || '<div class="col-span-2 text-center text-slate-500 font-bold py-10" data-i18n="no_relays">No active relays</div>';
+
                 document.getElementById('eng-sensors').innerHTML = engHTML;
                 document.getElementById('eng-ao-scaling').innerHTML = sysTempHTML + aoHTML;
+                document.getElementById('eng-relays-list').innerHTML = relaysEngHTML;
                 
                 isInitialized = true;
                 applyLang();
@@ -2080,6 +2270,7 @@ def get_gui():
                     if(!isInitialized) { 
                         configData = d.config; 
                         if (!configData.sensors) configData.sensors = {}; 
+                        if (!configData.relays) configData.relays = {};
                         
                         if (configData.theme && !themeInitialized) {
                             themeInitialized = true;
@@ -2207,15 +2398,68 @@ def get_gui():
                     }
 
                     if(currentTab === 'ctrl') {
-                        for(let i=0; i<4; i++) {
-                            const toggle = document.getElementById('relay-' + i);
+                        for(let i=0; i<8; i++) {
+                            const toggle = document.getElementById('relay-toggle-' + i);
                             if(toggle && document.activeElement !== toggle) toggle.checked = (d.relays[i] === 1);
+                        }
+                        
+                        for(let i=0; i<4; i++) {
+                            const ao = d.ao_manual[i];
+                            if(ao) {
+                                const toggle = document.getElementById('ao-toggle-' + i);
+                                const slider = document.getElementById('ao-slider-' + i);
+                                const box = document.getElementById('ao-ctrl-box-' + i);
+                                const valTxt = document.getElementById('ao-val-' + i);
+                                
+                                if(toggle && document.activeElement !== toggle) {
+                                    toggle.checked = ao.active;
+                                    if(ao.active) box.classList.remove('opacity-50', 'pointer-events-none');
+                                    else box.classList.add('opacity-50', 'pointer-events-none');
+                                }
+                                if(slider && document.activeElement !== slider) {
+                                    slider.value = ao.val;
+                                    valTxt.innerText = parseFloat(ao.val).toFixed(1);
+                                }
+                            }
                         }
                     }
                 } catch (e) {}
             }
 
             setInterval(update, 1000);
+            
+            async function autoDetectIo(type, inputId, btnId) {
+                const btn = document.getElementById(btnId);
+                const origText = btn.innerHTML;
+                const origClasses = btn.className;
+                
+                btn.innerHTML = "SCANNING...";
+                btn.className = "px-3 py-1.5 bg-amber-500 text-white rounded text-[10px] font-black uppercase tracking-wider transition-colors";
+                
+                try {
+                    const res = await fetch(`/api/scan_io?module_type=${type}`);
+                    const data = await res.json();
+                    
+                    if(data.status === 'ok') {
+                        document.getElementById(inputId).value = data.id;
+                        await triggerSave(); 
+                        
+                        btn.innerHTML = `FOUND: ID ${data.id}`;
+                        btn.className = "px-3 py-1.5 bg-emerald-500 text-white rounded text-[10px] font-black uppercase tracking-wider transition-colors";
+                    } else {
+                        btn.innerHTML = "NOT FOUND";
+                        btn.className = "px-3 py-1.5 bg-rose-500 text-white rounded text-[10px] font-black uppercase tracking-wider transition-colors";
+                    }
+                } catch(e) {
+                    btn.innerHTML = "ERROR";
+                    btn.className = "px-3 py-1.5 bg-rose-500 text-white rounded text-[10px] font-black uppercase tracking-wider transition-colors";
+                }
+                
+                setTimeout(() => {
+                    btn.innerHTML = origText;
+                    btn.className = origClasses;
+                }, 3000);
+            }
         </script>
     </body>
     </html>
