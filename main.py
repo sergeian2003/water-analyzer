@@ -11,6 +11,7 @@ import json
 import signal
 import shutil
 import math
+import glob
 from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse
@@ -24,7 +25,15 @@ STATIC_DIR = os.path.join(BASE_DIR, 'static')
 os.makedirs(LOG_DIR, exist_ok=True) 
 os.makedirs(STATIC_DIR, exist_ok=True)
 
-PORT = '/dev/ttyUSB0'
+def get_active_port():
+    ports = glob.glob('/dev/ttyUSB*')
+    if ports:
+        ports.sort()
+        return ports[0]
+    return '/dev/ttyUSB0'
+
+PORT = get_active_port()
+
 LOG_5MIN = os.path.join(LOG_DIR, 'data_5min.csv')
 LOG_1HR = os.path.join(LOG_DIR, 'data_1hr.csv')
 LOG_ALARM = os.path.join(LOG_DIR, 'data_alarm.csv')
@@ -50,19 +59,15 @@ DEFAULT_CONFIG = {
     "relay_name": "KM6063 Relay Module",
     "ao_name": "KM6023 Analog Output",
     "sys_temp": {"sensor": "", "ch": 4, "min": 0, "max": 50},
-    "relays": {
-        "0": {"label": "Pump 1 (Inlet)", "enabled": True},
-        "1": {"label": "Pump 2 (Outlet)", "enabled": True},
-        "2": {"label": "Aerator", "enabled": True},
-        "3": {"label": "Drain Valve", "enabled": True},
-        "4": {"label": "Relay 5", "enabled": False},
-        "5": {"label": "Relay 6", "enabled": False},
-        "6": {"label": "Relay 7", "enabled": False},
-        "7": {"label": "Relay 8", "enabled": False}
+    "relay_actions": {
+        "r_0": {"label": "Pump 1 (Inlet)", "modbus_id": 8, "ch": 0, "enabled": True},
+        "r_1": {"label": "Pump 2 (Outlet)", "modbus_id": 8, "ch": 1, "enabled": True},
+        "r_2": {"label": "Aerator", "modbus_id": 8, "ch": 2, "enabled": True},
+        "r_3": {"label": "Drain Valve", "modbus_id": 8, "ch": 3, "enabled": True}
     },
     "sensors": {
-        "s_1": {"id": 15, "type": "mlss", "enabled": True, "label": "MLSS", "color": "#94a3b8", "unit": "mg/L", "min": 0, "max": 10000, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel": 0},
-        "s_2": {"id": 16, "type": "uv254", "enabled": True, "label": "UV254 (COD)", "color": "#3b82f6", "unit": "mg/L", "min": 0, "max": 100, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel": 0}
+        "s_1": {"id": 15, "type": "mlss", "enabled": True, "label": "MLSS", "color": "#94a3b8", "unit": "mg/L", "min": 0, "max": 10000, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel_key": ""},
+        "s_2": {"id": 16, "type": "uv254", "enabled": True, "label": "UV254 (COD)", "color": "#3b82f6", "unit": "mg/L", "min": 0, "max": 100, "a": 1.0, "b": 0.0, "c_mode": "off", "c_int": 30, "c_dur": 10, "c_rel_key": ""}
     }
 }
 
@@ -75,22 +80,31 @@ def load_config():
                 if "lang" not in cfg: cfg["lang"] = "en"
                 if "admin_pwd" not in cfg: cfg["admin_pwd"] = "1234"
                 if "ao_id" not in cfg: cfg["ao_id"] = 9
+                if "relay_id" not in cfg: cfg["relay_id"] = 8
                 if "relay_name" not in cfg: cfg["relay_name"] = "KM6063 Relay Module"
                 if "ao_name" not in cfg: cfg["ao_name"] = "KM6023 Analog Output"
                 if "sys_temp" not in cfg: cfg["sys_temp"] = {"sensor": "", "ch": 4, "min": 0, "max": 50}
                 
-                if "relays" not in cfg:
-                    cfg["relays"] = DEFAULT_CONFIG["relays"]
+                if "relay_actions" not in cfg:
+                    old_relays = cfg.pop("relays", {})
+                    cfg["relay_actions"] = {}
+                    for k, v in old_relays.items():
+                        if int(k) < 4: 
+                            cfg["relay_actions"][f"r_{k}"] = {
+                                "label": v.get("label", f"Relay {k}"),
+                                "modbus_id": cfg.get("relay_id", 8),
+                                "ch": int(k),
+                                "enabled": v.get("enabled", True)
+                            }
+                    if not cfg["relay_actions"]:
+                        cfg["relay_actions"] = DEFAULT_CONFIG["relay_actions"]
                 
                 if "sensors" not in cfg: cfg["sensors"] = {} 
                 
                 for k, v in cfg.get("sensors", {}).items():
                     s_type = v.get("type", "mlss")
                     if "unit" not in v:
-                        default_units = {
-                            "mlss":"mg/L", "uv254":"mg/L", "do":"mg/L", "orp":"mV", "oil":"ug/L",
-                            "ph":"pH", "ec":"uS/cm", "turbidity":"NTU"
-                        }
+                        default_units = {"mlss":"mg/L", "uv254":"mg/L", "do":"mg/L", "orp":"mV", "oil":"ug/L", "ph":"pH", "ec":"uS/cm", "turbidity":"NTU"}
                         v["unit"] = default_units.get(s_type, "")
                     if "min" not in v: v["min"] = 0
                     if "max" not in v: v["max"] = 100
@@ -99,7 +113,7 @@ def load_config():
                     if "c_mode" not in v: v["c_mode"] = "off"
                     if "c_int" not in v: v["c_int"] = 30
                     if "c_dur" not in v: v["c_dur"] = 10
-                    if "c_rel" not in v: v["c_rel"] = 0
+                    if "c_rel_key" not in v: v["c_rel_key"] = ""
                 return cfg
         except: return DEFAULT_CONFIG
     return DEFAULT_CONFIG
@@ -109,10 +123,9 @@ def save_config(cfg):
 
 config = load_config()
 
-# --- 동적 데이터 엔진 ---
 sensor_data = {"sys_temp": "--", "sys_temp_ao": "0.00"}
 history_data = {}
-relay_states = [0]*8
+relay_states = {} 
 ao_manual = {i: {"active": False, "val": 4.0} for i in range(8)}
 
 hourly_buffer = {}
@@ -122,13 +135,15 @@ clean_last_run = {}
 clean_relay_off = {}
 
 def init_data_structures():
-    global sensor_data, history_data, hourly_buffer, alarm_states, clean_last_run, clean_relay_off
+    global sensor_data, history_data, hourly_buffer, alarm_states, clean_last_run, clean_relay_off, relay_states
     sensor_data = {"status": "Online", "sys_temp": "--", "sys_temp_ao": "0.00"}
     history_data = {}
     hourly_buffer = {}
     alarm_states = {}
     clean_last_run = {}
     clean_relay_off = {}
+    
+    relay_states = {k: 0 for k in config.get("relay_actions", {}).keys()}
     
     for key, s in config.get("sensors", {}).items():
         if s["type"] == "uv254":
@@ -156,6 +171,9 @@ def create_instrument(sensor_id):
     if _shared_instr is None:
         _shared_instr = minimalmodbus.Instrument(PORT, int(sensor_id))
         _shared_instr.serial.baudrate = 9600
+        _shared_instr.serial.bytesize = 8
+        _shared_instr.serial.parity = minimalmodbus.serial.PARITY_NONE
+        _shared_instr.serial.stopbits = 2  
         _shared_instr.serial.timeout = 0.7  
         _shared_instr.clear_buffers_before_each_transaction = True
     else:
@@ -186,7 +204,7 @@ def get_safe_int(val, default_val=0):
     except:
         return default_val
 
-def trigger_cleaning(key, force_mode=None, force_dur=None, force_rel=None):
+def trigger_cleaning(key, force_mode=None, force_dur=None, force_rel_key=None):
     global clean_relay_off
     s = config.get("sensors", {}).get(key)
     if not s: return {"status": "error", "message": "Sensor not found"}
@@ -204,15 +222,16 @@ def trigger_cleaning(key, force_mode=None, force_dur=None, force_rel=None):
                     read_with_retry(instr.write_registers, 12544, [1], retries=2)
         
         elif c_mode == "external":
-            c_rel = force_rel if force_rel is not None else get_safe_int(s.get("c_rel", 0))
+            c_rel_key = force_rel_key if force_rel_key is not None else s.get("c_rel_key", "")
             c_dur = force_dur if force_dur is not None else get_safe_int(s.get("c_dur", 10))
-            r_id = get_safe_int(config.get("relay_id", 8), 8)
-            with modbus_lock:
-                instr = create_instrument(r_id)
-                read_with_retry(instr.write_bit, c_rel, 1, 5, retries=2)
-                
-            clean_relay_off[c_rel] = time.time() + c_dur
-            relay_states[c_rel] = 1 
+            
+            act = config.get("relay_actions", {}).get(c_rel_key)
+            if act:
+                with modbus_lock:
+                    instr = create_instrument(act["modbus_id"])
+                    read_with_retry(instr.write_bit, act["ch"], 1, 5, retries=2)
+                clean_relay_off[c_rel_key] = time.time() + c_dur
+                relay_states[c_rel_key] = 1 
             
         return {"status": "ok"}
     except Exception as e:
@@ -238,22 +257,22 @@ def cleaning_worker():
                 trigger_cleaning(key)
                 clean_last_run[key] = now
                 
-        for ch, off_time in list(clean_relay_off.items()):
+        for act_key, off_time in list(clean_relay_off.items()):
             if now >= off_time:
-                try:
-                    r_id = get_safe_int(config.get("relay_id", 8), 8)
-                    with modbus_lock:
-                        instr = create_instrument(r_id)
-                        read_with_retry(instr.write_bit, int(ch), 0, 5, retries=2)
-                    relay_states[int(ch)] = 0
-                    del clean_relay_off[ch]
-                except: pass
+                act = config.get("relay_actions", {}).get(act_key)
+                if act:
+                    try:
+                        with modbus_lock:
+                            instr = create_instrument(act["modbus_id"])
+                            read_with_retry(instr.write_bit, act["ch"], 0, 5, retries=2)
+                        relay_states[act_key] = 0
+                    except: pass
+                del clean_relay_off[act_key]
                 
         time.sleep(1)
 
 def modbus_worker():
     global sensor_data, history_data, hourly_buffer, alarm_states
-    
     last_5min_minute = -1
     last_1hr_hour = -1
     
@@ -261,16 +280,12 @@ def modbus_worker():
         now = datetime.now()
         all_keys = list(config.get("sensors", {}).keys())
         active_keys = [k for k in all_keys if config["sensors"][k].get("enabled")]
-        
-        # 신규: 아날로그 출력 목표값을 모아둘 딕셔너리 (기본 4.0mA)
         auto_ao_out = {0: 4.0, 1: 4.0, 2: 4.0, 3: 4.0}
         
         try:
             sensors_cfg = list(config.get("sensors", {}).items())
-            
             for key, s in sensors_cfg:
                 if key not in sensor_data or key not in history_data: continue
-                    
                 if not s.get("enabled", False):
                     if s["type"] == "uv254": sensor_data[key] = {"val": "Off", "temp": "--", "turb": "--", "ao": "0.00", "status": "OFF"}
                     else: sensor_data[key] = {"val": "Off", "temp": "--", "ao": "0.00", "status": "OFF"}
@@ -287,7 +302,6 @@ def modbus_worker():
                     with modbus_lock:
                         instr = create_instrument(s_id)
                         raw_val = None
-                        
                         if s_type == "mlss":
                             raw_val = read_with_retry(instr.read_float, 6, 3, 2)
                         elif s_type == "uv254":
@@ -319,14 +333,10 @@ def modbus_worker():
                             base_val = (raw_val * a_val) + b_val
                             
                             val_num = base_val
-                            if s_type == "oil" and s_unit in ["mg/L", "ppm"]:
-                                val_num = base_val / 1000.0
-                            elif s_type == "mlss" and s_unit == "g/L":
-                                val_num = base_val / 1000.0
-                            elif s_type == "mlss" and s_unit == "%":
-                                val_num = base_val / 10000.0
-                            elif s_type == "ec" and s_unit == "mS/cm":
-                                val_num = base_val / 1000.0
+                            if s_type == "oil" and s_unit in ["mg/L", "ppm"]: val_num = base_val / 1000.0
+                            elif s_type == "mlss" and s_unit == "g/L": val_num = base_val / 1000.0
+                            elif s_type == "mlss" and s_unit == "%": val_num = base_val / 10000.0
+                            elif s_type == "ec" and s_unit == "mS/cm": val_num = base_val / 1000.0
                             
                             fmt = "{:.1f}" if s_type == "orp" else "{:.2f}"
                             sensor_data[key]["val"] = fmt.format(val_num)
@@ -355,7 +365,6 @@ def modbus_worker():
                         sensor_data[key]["ao"] = f"{ao_val:.2f}"
                         sensor_data[key]["status"] = "OK"
                         
-                        # 자동 모드일 경우 값을 버퍼에 저장
                         if key in active_keys:
                             ch_index = active_keys.index(key) 
                             if ch_index < 4: 
@@ -378,7 +387,6 @@ def modbus_worker():
                     if len(history_data[key]) > 0: history_data[key].pop(0)
                     history_data[key].append(None)
 
-            # === MASTER SYSTEM TEMP AO ===
             sys_t_cfg = config.get("sys_temp", {})
             m_sensor = sys_t_cfg.get("sensor")
             
@@ -387,18 +395,14 @@ def modbus_worker():
                     sys_t_val = float(sensor_data[m_sensor]["temp"])
                     t_min = float(sys_t_cfg.get("min", 0))
                     t_max = float(sys_t_cfg.get("max", 50))
-                    
                     if t_max <= t_min: t_ao = 4.0
                     else:
                         c_t = max(t_min, min(sys_t_val, t_max))
                         t_ao = 4.0 + ((c_t - t_min) / (t_max - t_min)) * 16.0
-                        
                     sensor_data["sys_temp"] = f"{sys_t_val:.1f}"
                     sensor_data["sys_temp_ao"] = f"{t_ao:.2f}"
-                    
                     t_ch = int(sys_t_cfg.get("ch", 4))
-                    if t_ch < 4:
-                        auto_ao_out[t_ch] = t_ao
+                    if t_ch < 4: auto_ao_out[t_ch] = t_ao
                 except Exception:
                     sensor_data["sys_temp"] = "--"
                     sensor_data["sys_temp_ao"] = "0.00"
@@ -406,23 +410,24 @@ def modbus_worker():
                 sensor_data["sys_temp"] = "--"
                 sensor_data["sys_temp_ao"] = "0.00"
 
-            # === NEW CENTRALIZED AO WRITE BLOCK ===
-            # 통신 병목을 해결하기 위해, 수동/자동 여부를 판단하여 여기서 한 번만 전송합니다.
+            # === CENTRALIZED AO WRITE BLOCK ===
             try:
                 ao_id = get_safe_int(config.get("ao_id", 9), 9)
                 with modbus_lock:
                     instr_ao = create_instrument(ao_id)
                     for c in range(4):
-                        if ao_manual.get(c, {}).get("active"):
-                            target_ao = ao_manual[c]["val"]
-                        else:
-                            target_ao = auto_ao_out[c]
+                        is_manual = ao_manual.get(c, {}).get("active")
+                        target_ao = ao_manual[c]["val"] if is_manual else auto_ao_out.get(c, 4.0)
+                        
+                        dac_val = int(((target_ao - 4.0) / 16.0) * 4095)
+                    
+                        dac_val = max(0, min(4095, dac_val))
                         
                         try:
-                            # 1초마다 지속적으로 값 푸시 (수동 모드 포함)
-                            read_with_retry(instr_ao.write_register, c, int(target_ao * 1000), 0, 6, retries=1)
-                        except: pass
-            except: pass
+                            read_with_retry(instr_ao.write_register, c, dac_val, 0, 6, retries=1)
+                            time.sleep(0.02)
+                        except Exception: pass
+            except Exception: pass
 
             # === LOGS WRITING ===
             if all_keys:
@@ -506,27 +511,27 @@ async def update_cfg(request: Request):
     return {"status": "ok"}
 
 @app.get("/api/relay")
-def toggle_relay(ch: int, state: int):
-    relay_states[ch] = state
-    try:
-        r_id = get_safe_int(config.get("relay_id", 8), 8)
-        with modbus_lock:
-            instr = create_instrument(r_id)
-            read_with_retry(instr.write_bit, ch, state, 5, retries=2)
-    except: pass
+def toggle_relay(key: str, state: int):
+    act = config.get("relay_actions", {}).get(key)
+    if act:
+        relay_states[key] = state
+        try:
+            with modbus_lock:
+                instr = create_instrument(act["modbus_id"])
+                read_with_retry(instr.write_bit, act["ch"], state, 5, retries=2)
+        except: pass
     return {"status": "ok"}
 
 @app.get("/api/ao_manual")
 def set_ao_manual(ch: int, active: int, val: float):
-    # 이제 여기서 직접 모듈로 쏘지 않고, 백그라운드 워커가 딕셔너리 값만 가져가서 처리합니다.
     if ch in ao_manual:
         ao_manual[ch]["active"] = bool(active)
         ao_manual[ch]["val"] = val
     return {"status": "ok"}
 
 @app.get("/api/trigger_clean")
-def trigger_clean_api(key: str, mode: str = None, dur: int = 10, rel: int = 0):
-    return trigger_cleaning(key, force_mode=mode, force_dur=dur, force_rel=rel)
+def trigger_clean_api(key: str, mode: str = None, dur: int = 10, rel_key: str = None):
+    return trigger_cleaning(key, force_mode=mode, force_dur=dur, force_rel_key=rel_key)
 
 @app.get("/api/export_options")
 def get_export_options(type: str):
@@ -648,15 +653,19 @@ def change_sensor_id(curr_id: int, new_id: int, s_type: str):
             
             if s_type == 'io_module':
                 try:
-                    instr.write_register(0, new_id, 0, functioncode=6)
-                except minimalmodbus.IllegalRequestError:
-                    instr.write_registers(0, [new_id])
+                    current_reg = instr.read_register(0, 0)
+                    baud_rate_code = current_reg & 0x00FF  
+                    new_val = (new_id << 8) | baud_rate_code 
+                    instr.write_register(0, new_val, 0, functioncode=6)
                 except Exception:
-                    pass
+                    fallback_val = (new_id << 8) | 3
+                    try:
+                        instr.write_register(0, fallback_val, 0, functioncode=6)
+                    except Exception as e2:
+                        return {"status": "error", "message": str(e2)}
                 return {"status": "ok"}
 
             id_register = 25 if s_type == 'mlss' else 12288
-            
             try:
                 current_reg = instr.read_register(id_register, 0)
             except Exception:
@@ -703,9 +712,15 @@ def scan_io_module(module_type: str):
                 instr.serial.timeout = 0.05  
                 
                 try:
-                    instr.read_register(0, 0, 3)
+                    if module_type == 'ao':
+                        instr.read_register(560, 0, 3)
+                    else:
+                        instr.read_bit(0, 1)
                     return {"status": "ok", "id": i}
-                except: pass
+                except minimalmodbus.IllegalRequestError:
+                    return {"status": "ok", "id": i}
+                except Exception: 
+                    pass
                     
         return {"status": "error", "message": "Module not found on bus"}
     except Exception as e:
@@ -975,7 +990,7 @@ def get_gui():
                     <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700">
                         <div class="flex justify-between items-end mb-3">
                             <div class="flex flex-col">
-                                <span class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-0.5" data-i18n="relay_module_title">RELAY MODULE</span>
+                                <span class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-0.5" data-i18n="relay_module_title">DEFAULT RELAY ID</span>
                                 <input type="text" id="eng-relay-name" onchange="triggerSave()" class="text-xs font-black text-slate-700 dark:text-slate-300 uppercase tracking-widest bg-transparent border-b border-slate-300 dark:border-slate-600 hover:border-indigo-400 focus:border-indigo-500 outline-none w-48 pb-1">
                             </div>
                             <button id="btn-scan-relay" onclick="autoDetectIo('relay', 'eng-relay-id', 'btn-scan-relay')" class="px-3 py-1.5 bg-indigo-100 text-indigo-600 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-400 rounded text-[10px] font-black uppercase tracking-wider transition-colors border border-indigo-200 dark:border-indigo-800">
@@ -992,7 +1007,7 @@ def get_gui():
                     <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700">
                         <div class="flex justify-between items-end mb-3">
                             <div class="flex flex-col">
-                                <span class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-0.5" data-i18n="ao_module_title">ANALOG OUTPUT</span>
+                                <span class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-0.5" data-i18n="ao_module_title">ANALOG OUTPUT ID</span>
                                 <input type="text" id="eng-ao-name" onchange="triggerSave()" class="text-xs font-black text-slate-700 dark:text-slate-300 uppercase tracking-widest bg-transparent border-b border-slate-300 dark:border-slate-600 hover:border-indigo-400 focus:border-indigo-500 outline-none w-48 pb-1">
                             </div>
                             <button id="btn-scan-ao" onclick="autoDetectIo('ao', 'eng-ao-id', 'btn-scan-ao')" class="px-3 py-1.5 bg-indigo-100 text-indigo-600 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-400 rounded text-[10px] font-black uppercase tracking-wider transition-colors border border-indigo-200 dark:border-indigo-800">
@@ -1248,7 +1263,80 @@ def get_gui():
             </div>
         </div>
 
+        <div id="custom-alert-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-[100] flex justify-center items-center p-4">
+            <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[350px] p-6 shadow-2xl flex flex-col transform scale-95 transition-transform duration-200" id="custom-alert-box">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-sky-600 dark:text-sky-400 font-black text-lg uppercase tracking-wider flex items-center gap-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z" /></svg>
+                        <span id="custom-alert-title">Notification</span>
+                    </h2>
+                </div>
+                <p id="custom-alert-msg" class="text-sm font-bold text-slate-600 dark:text-slate-300 mb-6 leading-relaxed"></p>
+                <div class="flex justify-end">
+                    <button onclick="closeCustomAlert()" class="px-6 py-2 bg-sky-600 rounded text-sm font-bold text-white hover:bg-sky-500 shadow-md transition-colors w-full">OK</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="custom-confirm-overlay" class="modal-overlay fixed inset-0 bg-slate-900/60 dark:bg-black/80 hidden z-[100] flex justify-center items-center p-4">
+            <div class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl w-[350px] p-6 shadow-2xl flex flex-col transform scale-95 transition-transform duration-200" id="custom-confirm-box">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-rose-600 dark:text-rose-500 font-black text-lg uppercase tracking-wider flex items-center gap-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+                        <span id="custom-confirm-title">Warning</span>
+                    </h2>
+                </div>
+                <p id="custom-confirm-msg" class="text-sm font-bold text-slate-600 dark:text-slate-300 mb-6 leading-relaxed"></p>
+                <div class="flex justify-end gap-3">
+                    <button onclick="closeCustomConfirm()" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 shadow-sm transition-colors w-1/2">CANCEL</button>
+                    <button onclick="executeCustomConfirm()" id="custom-confirm-btn" class="px-5 py-2 bg-rose-600 rounded text-sm font-bold text-white hover:bg-rose-500 shadow-md transition-colors w-1/2">CONFIRM</button>
+                </div>
+            </div>
+        </div>
+
         <script>
+            // --- CUSTOM DIALOG FUNCTIONS ---
+            function customAlert(msg) {
+                document.getElementById('custom-alert-msg').innerText = msg;
+                document.getElementById('custom-alert-title').innerText = (configData && configData.lang === 'ko') ? "알림" : "Notification";
+                const overlay = document.getElementById('custom-alert-overlay');
+                const box = document.getElementById('custom-alert-box');
+                overlay.classList.remove('hidden');
+                setTimeout(() => box.classList.remove('scale-95'), 10);
+            }
+            function closeCustomAlert() {
+                const overlay = document.getElementById('custom-alert-overlay');
+                const box = document.getElementById('custom-alert-box');
+                box.classList.add('scale-95');
+                setTimeout(() => overlay.classList.add('hidden'), 200);
+            }
+
+            let currentConfirmCallback = null;
+            function customConfirm(msg, callback) {
+                document.getElementById('custom-confirm-msg').innerText = msg;
+                document.getElementById('custom-confirm-title').innerText = (configData && configData.lang === 'ko') ? "경고" : "Warning";
+                document.getElementById('custom-confirm-btn').innerText = (configData && configData.lang === 'ko') ? "확인" : "CONFIRM";
+                
+                currentConfirmCallback = callback;
+                
+                const overlay = document.getElementById('custom-confirm-overlay');
+                const box = document.getElementById('custom-confirm-box');
+                overlay.classList.remove('hidden');
+                setTimeout(() => box.classList.remove('scale-95'), 10);
+            }
+            function closeCustomConfirm() {
+                const overlay = document.getElementById('custom-confirm-overlay');
+                const box = document.getElementById('custom-confirm-box');
+                box.classList.add('scale-95');
+                setTimeout(() => overlay.classList.add('hidden'), 200);
+                currentConfirmCallback = null;
+            }
+            function executeCustomConfirm() {
+                if(currentConfirmCallback) currentConfirmCallback();
+                closeCustomConfirm();
+            }
+            // -------------------------------
+
             let currentTab = 'dash';
             let currentChartMode = 'all';
             let currentLogView = '5min';
@@ -1283,14 +1371,15 @@ def get_gui():
                     clean_title: "CLEANING SETUP", ctrl_mode: "Control Mode", test_now: "TEST NOW",
                     btn_cal: "CALIBRATION", btn_clean: "CLEANING", cal_title: "CALIBRATION",
                     sensor_type: "SENSOR TYPE", unit_label: "UNIT", modbus_id: "MODBUS ID (1-247)", display_label: "DISPLAY LABEL", chart_color: "CHART COLOR",
-                    relay_module_title: "RELAY MODULE", ao_module_title: "ANALOG OUTPUT",
+                    relay_module_title: "DEFAULT RELAY ID", ao_module_title: "ANALOG OUTPUT ID",
                     interval_min: "Interval (Minutes)", duration_sec: "Duration (Seconds)", relay_channel: "Relay Channel",
-                    opt_off: "OFF (No Cleaning)", opt_int: "INTERNAL (Sensor Wiper)", opt_ext: "EXTERNAL (Relay)",
+                    opt_off: "OFF (No Cleaning)", opt_int: "INTERNAL (Sensor Wiper)", opt_ext: "EXTERNAL (Relay Action)",
                     id_tool: "ID TOOL", id_tool_title: "CHANGE SENSOR ID", id_tool_warn: "[WARNING] Only ONE device must be connected to the bus!",
                     current_id: "CURRENT ID (255=Broadcast)", new_id: "NEW ID", change_id: "CHANGE ID", std_sensors: "Standard Sensors", mlss_sensor: "MLSS Sensor",
                     sys_temp_setup: "Master Temperature Setup", sys_temp: "SYSTEM TEMP",
                     start_date: "Start Date", end_date: "End Date", search: "Search", clear: "Clear", no_relays: "No active relays",
-                    io_module_type: "I/O Module (KM60xx Relay/AO)", manual_ao: "Manual Analog Output"
+                    io_module_type: "I/O Module (KM60xx Relay/AO)", manual_ao: "Manual Analog Output",
+                    modbus_id_short: "ID", ch_short: "CH", add_action: "+ ADD NEW ACTION"
                 },
                 ko: {
                     nav_dash: "대시보드", nav_trends: "트렌드", nav_logs: "로그", nav_ctrl: "제어", nav_setup: "설정", theme: "테마", exit: "종료",
@@ -1304,14 +1393,15 @@ def get_gui():
                     clean_title: "세정(Cleaning) 설정", ctrl_mode: "제어 모드", test_now: "지금 테스트",
                     btn_cal: "교정 (CAL)", btn_clean: "세정 (CLEAN)", cal_title: "센서 교정",
                     sensor_type: "센서 종류", unit_label: "단위", modbus_id: "모드버스 ID (1-247)", display_label: "표시 이름", chart_color: "차트 색상",
-                    relay_module_title: "릴레이 모듈", ao_module_title: "아날로그 출력",
+                    relay_module_title: "기본 릴레이 ID", ao_module_title: "아날로그 출력 ID",
                     interval_min: "작동 주기 (분)", duration_sec: "작동 시간 (초)", relay_channel: "릴레이 채널",
                     opt_off: "사용 안함 (OFF)", opt_int: "내부 와이퍼 (INTERNAL)", opt_ext: "외부 릴레이 (EXTERNAL)",
                     id_tool: "ID 변경 툴", id_tool_title: "센서 ID 변경", id_tool_warn: "[주의] 통신선에 변경할 장치 1개만 연결하세요!",
                     current_id: "현재 ID (모를경우 255)", new_id: "새로운 ID", change_id: "ID 변경", std_sensors: "일반 센서 (pH, DO, ORP 등)", mlss_sensor: "MLSS 센서",
                     sys_temp_setup: "시스템 온도 설정 (마스터)", sys_temp: "시스템 온도",
                     start_date: "시작일", end_date: "종료일", search: "조회", clear: "초기화", no_relays: "활성화된 릴레이가 없습니다",
-                    io_module_type: "I/O 모듈 (KM60xx 릴레이/AO)", manual_ao: "수동 아날로그 출력 테스트"
+                    io_module_type: "I/O 모듈 (KM60xx 릴레이/AO)", manual_ao: "수동 아날로그 출력 테스트",
+                    modbus_id_short: "ID", ch_short: "CH", add_action: "+ 새 동작 추가"
                 }
             };
 
@@ -1358,17 +1448,12 @@ def get_gui():
             async function triggerSave() {
                 if(!configData) return;
                 if(!configData.sensors) configData.sensors = {};
-                if(!configData.relays) configData.relays = {};
+                if(!configData.relay_actions) configData.relay_actions = {};
                 
                 const relayEl = document.getElementById('eng-relay-id');
                 if(relayEl) configData.relay_id = parseInt(relayEl.value) || 0;
                 const aoEl = document.getElementById('eng-ao-id');
                 if(aoEl) configData.ao_id = parseInt(aoEl.value) || 0;
-                
-                const relayNameEl = document.getElementById('eng-relay-name');
-                if(relayNameEl) configData.relay_name = relayNameEl.value;
-                const aoNameEl = document.getElementById('eng-ao-name');
-                if(aoNameEl) configData.ao_name = aoNameEl.value;
                 
                 if(document.getElementById('sys-t-sensor')) {
                     configData.sys_temp.sensor = document.getElementById('sys-t-sensor').value;
@@ -1379,19 +1464,34 @@ def get_gui():
                 
                 let needsRedraw = false;
 
-                for(let i=0; i<8; i++) {
-                    const enEl = document.getElementById('rel-en-'+i);
-                    const lblEl = document.getElementById('rel-lbl-'+i);
-                    if(enEl && lblEl) {
-                        if(!configData.relays[i]) configData.relays[i] = {};
-                        if (configData.relays[i].enabled !== enEl.checked || configData.relays[i].label !== lblEl.value) {
-                            configData.relays[i].enabled = enEl.checked;
-                            configData.relays[i].label = lblEl.value;
+                // Save Dynamic Relay Actions
+                for(const rKey of Object.keys(configData.relay_actions)) {
+                    const enEl = document.getElementById('rel-en-' + rKey);
+                    const midEl = document.getElementById('rel-mid-' + rKey);
+                    const chEl = document.getElementById('rel-ch-' + rKey);
+                    const lblEl = document.getElementById('rel-lbl-' + rKey);
+                    
+                    if(enEl && midEl && chEl && lblEl) {
+                        const newEn = enEl.checked;
+                        const newMid = parseInt(midEl.value) || 1;
+                        const newCh = parseInt(chEl.value) || 0;
+                        const newLbl = lblEl.value;
+
+                        if (configData.relay_actions[rKey].enabled !== newEn || 
+                            configData.relay_actions[rKey].label !== newLbl ||
+                            configData.relay_actions[rKey].modbus_id !== newMid ||
+                            configData.relay_actions[rKey].ch !== newCh) {
+                            
+                            configData.relay_actions[rKey].enabled = newEn;
+                            configData.relay_actions[rKey].modbus_id = newMid;
+                            configData.relay_actions[rKey].ch = newCh;
+                            configData.relay_actions[rKey].label = newLbl;
                             needsRedraw = true;
                         }
                     }
                 }
 
+                // Save Sensors Config
                 for(const key of Object.keys(configData.sensors)) {
                     const idEl = document.getElementById('id-' + key);
                     if(idEl) configData.sensors[key].id = parseInt(idEl.value) || 1;
@@ -1426,7 +1526,7 @@ def get_gui():
                         configData.sensors[key].c_mode = document.getElementById('clean-mode').value;
                         configData.sensors[key].c_int = parseInt(document.getElementById('clean-int').value);
                         configData.sensors[key].c_dur = parseInt(document.getElementById('clean-dur').value);
-                        configData.sensors[key].c_rel = parseInt(document.getElementById('clean-rel').value);
+                        configData.sensors[key].c_rel_key = document.getElementById('clean-rel').value;
                     }
 
                     if(document.getElementById('cal-sensor-key') && document.getElementById('cal-sensor-key').value === key && !document.getElementById('cal-modal-overlay').classList.contains('hidden')) {
@@ -1462,6 +1562,19 @@ def get_gui():
                 if(id.startsWith('id-') || id.startsWith('min-') || id.startsWith('max-') || id.startsWith('sys-') || id === 'eng-relay-id' || id === 'eng-ao-id' || id.startsWith('clean-') || id.startsWith('cal-soft-')) {
                     triggerSave();
                 }
+            }
+            
+            function addRelayAction() {
+                const newKey = 'r_' + Date.now();
+                configData.relay_actions[newKey] = { label: "New Action", modbus_id: configData.relay_id || 8, ch: 0, enabled: true };
+                triggerSave().then(() => initDynamicUI());
+            }
+
+            function deleteRelayAction(key) {
+                customConfirm(configData.lang === 'ko' ? '이 동작을 삭제하시겠습니까?' : 'Delete this action?', () => {
+                    delete configData.relay_actions[key];
+                    triggerSave().then(() => initDynamicUI());
+                });
             }
 
             function updateAoManual(ch) {
@@ -1547,7 +1660,7 @@ def get_gui():
             function saveNewPwd() {
                 const newPwd = document.getElementById('new-pwd-input').value;
                 if(newPwd.trim() === '') {
-                    alert(configData.lang === 'ko' ? "비밀번호를 입력하세요." : "Please enter a password.");
+                    customAlert(configData.lang === 'ko' ? "비밀번호를 입력하세요." : "Please enter a password.");
                     return;
                 }
                 configData.admin_pwd = newPwd;
@@ -1558,8 +1671,6 @@ def get_gui():
             function openIoModal() {
                 document.getElementById('eng-relay-id').value = configData.relay_id;
                 document.getElementById('eng-ao-id').value = configData.ao_id;
-                document.getElementById('eng-relay-name').value = configData.relay_name || 'KM6063 Relay Module';
-                document.getElementById('eng-ao-name').value = configData.ao_name || 'KM6023 Analog Output';
                 document.getElementById('io-modal-overlay').classList.remove('hidden');
             }
             function closeIoModal() { document.getElementById('io-modal-overlay').classList.add('hidden'); }
@@ -1751,7 +1862,7 @@ def get_gui():
                 const newId = parseInt(document.getElementById('tool-new-id').value);
                 
                 if (isNaN(currId) || isNaN(newId)) {
-                    alert(configData.lang === 'ko' ? '올바른 숫자를 입력하세요.' : 'Please enter valid numbers.');
+                    customAlert(configData.lang === 'ko' ? '올바른 숫자를 입력하세요.' : 'Please enter valid numbers.');
                     return;
                 }
 
@@ -1770,13 +1881,13 @@ def get_gui():
                             closeIdTool(); 
                             btn.innerText = origText; 
                             btn.classList.replace('bg-emerald-600', 'bg-blue-600');
-                            alert(configData.lang === 'ko' ? "ID가 변경되었습니다! 센서의 전원을 껐다 켜주세요." : "ID changed! Please reboot the sensor (power off/on).");
+                            customAlert(configData.lang === 'ko' ? "ID가 변경되었습니다! 센서의 전원을 껐다 켜주세요." : "ID changed! Please reboot the sensor (power off/on).");
                         }, 1000);
                     } else {
                         btn.innerText = "FAILED";
                         btn.classList.replace('bg-blue-600', 'bg-rose-600');
                         setTimeout(() => { btn.innerText = origText; btn.classList.replace('bg-rose-600', 'bg-blue-600'); }, 2000);
-                        alert("Error: " + data.message);
+                        customAlert("Error: " + data.message);
                     }
                 } catch(e) {
                     btn.innerText = "ERROR";
@@ -1791,16 +1902,16 @@ def get_gui():
                 const color = document.getElementById('new-color').value;
                 const unit = document.getElementById('new-unit').value;
                 const newKey = 's_' + Date.now();
-                configData.sensors[newKey] = { id: id, type: type, enabled: true, label: label, color: color, unit: unit, min: 0, max: 100, a: 1.0, b: 0.0, c_mode: "off", c_int: 30, c_dur: 10, c_rel: 0 };
+                configData.sensors[newKey] = { id: id, type: type, enabled: true, label: label, color: color, unit: unit, min: 0, max: 100, a: 1.0, b: 0.0, c_mode: "off", c_int: 30, c_dur: 10, c_rel_key: "" };
                 triggerSave().then(() => { initDynamicUI(); });
                 closeModal();
             }
 
             function deleteSensor(key) {
-                if(confirm(configData.lang === 'ko' ? '이 센서를 삭제하시겠습니까?' : 'Are you sure you want to delete this sensor?')) {
+                customConfirm(configData.lang === 'ko' ? '이 센서를 삭제하시겠습니까?' : 'Are you sure you want to delete this sensor?', () => {
                     delete configData.sensors[key];
                     triggerSave().then(() => { initDynamicUI(); });
-                }
+                });
             }
 
             async function openCalModal(key, id, type, label) {
@@ -1850,7 +1961,7 @@ def get_gui():
                 const btn = document.getElementById('cal-save-btn');
 
                 if (isNaN(hwK) || isNaN(hwB)) {
-                    alert(configData.lang === 'ko' ? "올바른 숫자를 입력하세요." : "Please enter valid numeric values.");
+                    customAlert(configData.lang === 'ko' ? "올바른 숫자를 입력하세요." : "Please enter valid numeric values.");
                     return;
                 }
 
@@ -1898,15 +2009,14 @@ def get_gui():
                 
                 const relSelect = document.getElementById('clean-rel');
                 relSelect.innerHTML = '';
-                for(let i=0; i<8; i++) {
-                    const r = configData.relays[i];
-                    if(r && r.enabled) {
-                        relSelect.innerHTML += `<option value="${i}">CH ${i} - ${r.label}</option>`;
+                for(const [rKey, r] of Object.entries(configData.relay_actions || {})) {
+                    if(r.enabled) {
+                        relSelect.innerHTML += `<option value="${rKey}">ID ${r.modbus_id} : CH ${r.ch} - ${r.label}</option>`;
                     }
                 }
-                if(relSelect.innerHTML === '') relSelect.innerHTML = '<option value="0">No Relays Enabled</option>';
+                if(relSelect.innerHTML === '') relSelect.innerHTML = '<option value="">No Relays Enabled</option>';
                 
-                document.getElementById('clean-rel').value = s.c_rel !== undefined ? s.c_rel : 0;
+                document.getElementById('clean-rel').value = s.c_rel_key || "";
                 
                 updateCleanUI();
                 document.getElementById('clean-modal-overlay').classList.remove('hidden');
@@ -1939,7 +2049,7 @@ def get_gui():
                 const key = document.getElementById('clean-sensor-key').value;
                 const mode = document.getElementById('clean-mode').value;
                 const dur = parseInt(document.getElementById('clean-dur').value) || 10;
-                const rel = parseInt(document.getElementById('clean-rel').value) || 0;
+                const relKey = document.getElementById('clean-rel').value;
                 
                 const btn = document.getElementById('btn-test-clean');
                 const origHTML = btn.innerHTML;
@@ -1951,7 +2061,7 @@ def get_gui():
                 await triggerSave();
 
                 try {
-                    const res = await fetch(`/api/trigger_clean?key=${key}&mode=${mode}&dur=${dur}&rel=${rel}`);
+                    const res = await fetch(`/api/trigger_clean?key=${key}&mode=${mode}&dur=${dur}&rel_key=${relKey}`);
                     const data = await res.json();
                     
                     if (data.status === 'ok') {
@@ -1999,6 +2109,7 @@ def get_gui():
 
             function initDynamicUI() {
                 if (!configData.sensors) configData.sensors = {};
+                if (!configData.relay_actions) configData.relay_actions = {};
                 
                 const activeSensors = Object.entries(configData.sensors).filter(([k, v]) => v.enabled);
                 const count = activeSensors.length;
@@ -2222,28 +2333,41 @@ def get_gui():
                 `;
 
                 let relaysEngHTML = '';
-                for(let i=0; i<8; i++) {
-                    const r = configData.relays[i] || {label: 'CH ' + i, enabled: false};
+                for(const [rKey, r] of Object.entries(configData.relay_actions || {})) {
                     relaysEngHTML += `
                     <div class="flex items-center gap-3 bg-slate-50 dark:bg-slate-800/50 p-2.5 rounded border border-slate-200 dark:border-slate-700">
-                        <span class="text-[10px] font-black text-slate-500 w-8 text-center shrink-0 uppercase">CH ${i}</span>
                         <label class="relative inline-flex items-center cursor-pointer shrink-0">
-                            <input type="checkbox" id="rel-en-${i}" onchange="triggerSave()" ${r.enabled ? 'checked' : ''} class="sr-only peer">
+                            <input type="checkbox" id="rel-en-${rKey}" onchange="triggerSave()" ${r.enabled ? 'checked' : ''} class="sr-only peer">
                             <div class="w-9 h-5 bg-slate-300 dark:bg-slate-600 rounded-full peer-checked:bg-purple-500 after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-[16px]"></div>
                         </label>
-                        <input type="text" id="rel-lbl-${i}" onchange="triggerSave()" value="${r.label}" class="flex-1 bg-transparent text-sm font-bold outline-none text-slate-800 dark:text-white border-b border-transparent focus:border-purple-500 transition-colors px-1" placeholder="Relay Name">
+                        <div class="flex flex-col gap-1 w-16 shrink-0">
+                            <span class="text-[9px] text-slate-400 font-bold uppercase tracking-widest leading-none" data-i18n="modbus_id_short">ID</span>
+                            <input type="number" id="rel-mid-${rKey}" onchange="triggerSave()" value="${r.modbus_id}" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-1 py-0.5 text-xs font-black text-center outline-none text-slate-800 dark:text-white">
+                        </div>
+                        <div class="flex flex-col gap-1 w-12 shrink-0">
+                            <span class="text-[9px] text-slate-400 font-bold uppercase tracking-widest leading-none" data-i18n="ch_short">CH</span>
+                            <input type="number" id="rel-ch-${rKey}" onchange="triggerSave()" value="${r.ch}" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-1 py-0.5 text-xs font-black text-center outline-none text-slate-800 dark:text-white">
+                        </div>
+                        <div class="flex flex-col gap-1 flex-1">
+                            <span class="text-[9px] text-slate-400 font-bold uppercase tracking-widest leading-none">LABEL</span>
+                            <input type="text" id="rel-lbl-${rKey}" onchange="triggerSave()" value="${r.label}" class="w-full bg-transparent text-sm font-bold outline-none text-slate-800 dark:text-white border-b border-transparent focus:border-purple-500 transition-colors px-1" placeholder="Action Name">
+                        </div>
+                        <button onclick="deleteRelayAction('${rKey}')" class="text-rose-500 hover:text-rose-600 shrink-0 p-1"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" /></svg></button>
                     </div>`;
                 }
+                relaysEngHTML += `<button onclick="addRelayAction()" class="mt-2 w-full py-2 bg-purple-100 text-purple-700 hover:bg-purple-200 dark:bg-purple-900/30 dark:text-purple-400 dark:hover:bg-purple-800/50 rounded text-xs font-black uppercase tracking-wider transition-colors border border-purple-200 dark:border-purple-800 border-dashed" data-i18n="add_action">+ ADD NEW ACTION</button>`;
 
                 let ctrlHTML = '';
-                for(let i=0; i<8; i++) {
-                    const r = configData.relays[i];
-                    if(r && r.enabled) {
+                for(const [rKey, r] of Object.entries(configData.relay_actions || {})) {
+                    if(r.enabled) {
                         ctrlHTML += `
                         <div class="flex items-center justify-between bg-slate-100 dark:bg-slate-800/40 p-5 rounded-xl border border-slate-300 dark:border-slate-700/50 shadow-sm">
-                            <span class="text-sm font-bold text-slate-700 dark:text-slate-300 uppercase truncate pr-4">${r.label}</span>
+                            <div class="flex flex-col">
+                                <span class="text-sm font-bold text-slate-700 dark:text-slate-300 uppercase pr-4">${r.label}</span>
+                                <span class="text-[10px] font-black text-slate-400 uppercase tracking-widest">ID: ${r.modbus_id} | CH: ${r.ch}</span>
+                            </div>
                             <label class="relative inline-flex items-center cursor-pointer shrink-0">
-                                <input type="checkbox" id="relay-toggle-${i}" onchange="fetch('/api/relay?ch=${i}&state='+(this.checked?1:0))" class="sr-only peer">
+                                <input type="checkbox" id="relay-toggle-${rKey}" onchange="fetch('/api/relay?key=${rKey}&state='+(this.checked?1:0))" class="sr-only peer">
                                 <div class="w-14 h-7 bg-slate-300 dark:bg-slate-900 rounded-full border border-slate-400 dark:border-slate-600 peer-checked:bg-cyan-500 transition-colors after:content-[''] after:absolute after:top-[3px] after:left-[3px] after:bg-white dark:after:bg-slate-400 after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-[28px] peer-checked:after:bg-white"></div>
                             </label>
                         </div>`;
@@ -2270,7 +2394,7 @@ def get_gui():
                     if(!isInitialized) { 
                         configData = d.config; 
                         if (!configData.sensors) configData.sensors = {}; 
-                        if (!configData.relays) configData.relays = {};
+                        if (!configData.relay_actions) configData.relay_actions = {};
                         
                         if (configData.theme && !themeInitialized) {
                             themeInitialized = true;
@@ -2398,9 +2522,9 @@ def get_gui():
                     }
 
                     if(currentTab === 'ctrl') {
-                        for(let i=0; i<8; i++) {
-                            const toggle = document.getElementById('relay-toggle-' + i);
-                            if(toggle && document.activeElement !== toggle) toggle.checked = (d.relays[i] === 1);
+                        for(const rKey of Object.keys(configData.relay_actions || {})) {
+                            const toggle = document.getElementById('relay-toggle-' + rKey);
+                            if(toggle && document.activeElement !== toggle) toggle.checked = (d.relays[rKey] === 1);
                         }
                         
                         for(let i=0; i<4; i++) {
