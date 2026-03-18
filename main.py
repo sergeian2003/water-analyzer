@@ -114,6 +114,7 @@ def load_config():
                     if "c_int" not in v: v["c_int"] = 30
                     if "c_dur" not in v: v["c_dur"] = 10
                     if "c_rel_key" not in v: v["c_rel_key"] = ""
+                    if "contam" not in v: v["contam"] = {"enabled": False, "months": 3, "start_ts": time.time()}
                 return cfg
         except: return DEFAULT_CONFIG
     return DEFAULT_CONFIG
@@ -147,9 +148,9 @@ def init_data_structures():
     
     for key, s in config.get("sensors", {}).items():
         if s["type"] == "uv254":
-            sensor_data[key] = {"val": "--", "log_val": "--", "temp": "--", "turb": "--", "ao": "--", "status": "WAIT"}
+            sensor_data[key] = {"val": "--", "cod": "--", "log_val": "--", "temp": "--", "turb": "--", "ao": "--", "status": "WAIT", "contam_pct": 0}
         else:
-            sensor_data[key] = {"val": "--", "log_val": "--", "temp": "--", "ao": "--", "status": "WAIT"}
+            sensor_data[key] = {"val": "--", "log_val": "--", "temp": "--", "ao": "--", "status": "WAIT", "contam_pct": 0}
         history_data[key] = [None]*30
         hourly_buffer[key] = []
         alarm_states[key] = False
@@ -334,12 +335,36 @@ def modbus_worker():
                             
                             val_num = base_val
                             if s_type == "oil" and s_unit in ["mg/L", "ppm"]: val_num = base_val / 1000.0
-                            elif s_type == "mlss" and s_unit == "g/L": val_num = base_val / 1000.0
-                            elif s_type == "mlss" and s_unit == "%": val_num = base_val / 10000.0
-                            elif s_type == "ec" and s_unit == "mS/cm": val_num = base_val / 1000.0
-                            
+                        elif s_type == "mlss" and s_unit == "g/L": val_num = base_val / 1000.0
+                        elif s_type == "mlss" and s_unit == "%": val_num = base_val / 10000.0
+                        elif s_type == "ec" and s_unit == "mS/cm": val_num = base_val / 1000.0
+                        
+                        # --- ЛОГИКА ЗАГРЯЗНЕНИЯ (ИЗНОСА) ---
+                        contam_cfg = s.get("contam", {})
+                        contam_pct = 0
+                        is_contam_err = False
+                        
+                        if contam_cfg.get("enabled"):
+                            elapsed = time.time() - contam_cfg.get("start_ts", time.time())
+                            total_sec = int(contam_cfg.get("months", 3)) * 30 * 86400 # 30 дней в месяце
+                            if total_sec > 0:
+                                contam_pct = min(99, int((elapsed / total_sec) * 100))
+                            if contam_pct >= 99:
+                                is_contam_err = True
+                        
+                        sensor_data[key]["contam_pct"] = contam_pct
+
+                        if is_contam_err:
+                            val_num = None
+                            sensor_data[key]["val"] = "Err"
+                            if s_type == "uv254": 
+                                sensor_data[key]["cod"] = "Err"
+                            sensor_data[key]["log_val"] = "Err"
+                            sensor_data[key]["status"] = "CONTAM"
+                        else:
                             fmt = "{:.1f}" if s_type == "orp" else "{:.2f}"
                             sensor_data[key]["val"] = fmt.format(val_num)
+                            if s_type == "uv254": sensor_data[key]["cod"] = fmt.format(val_num)
                             sensor_data[key]["log_val"] = fmt.format(base_val)
                         
                         min_v = float(s.get("min", 0))
@@ -376,6 +401,7 @@ def modbus_worker():
                 except Exception as e:
                     if s["type"] == "uv254": 
                         sensor_data[key]["val"] = "Err"
+                        sensor_data[key]["cod"] = "Err"
                         sensor_data[key]["temp"] = "Err"
                         sensor_data[key]["turb"] = "Err"
                     else: 
@@ -419,13 +445,17 @@ def modbus_worker():
                         is_manual = ao_manual.get(c, {}).get("active")
                         target_ao = ao_manual[c]["val"] if is_manual else auto_ao_out.get(c, 4.0)
                         
-                        dac_val = int(((target_ao - 4.0) / 16.0) * 4095)
-                    
-                        dac_val = max(0, min(4095, dac_val))
+                        out_val = int(target_ao * 1000)
+                        out_val = max(0, min(20000, out_val)) # Лимит 20mA
                         
                         try:
-                            read_with_retry(instr_ao.write_register, c, dac_val, 0, 6, retries=1)
-                            time.sleep(0.02)
+                            # Адреса каналов: 2, 3, 4, 5
+                            reg_address = c + 2 
+                            # Отправляем по одному каналу (Функция 6), чтобы не перегружать чип
+                            read_with_retry(instr_ao.write_register, reg_address, out_val, 0, 6, retries=1)
+                            
+                            # ВАЖНО: Даем микроконтроллеру модуля 50 мс на физическое изменение тока
+                            time.sleep(0.05) 
                         except Exception: pass
             except Exception: pass
 
@@ -869,9 +899,12 @@ def get_gui():
                     <button onclick="clearLogFilter()" class="bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-white font-bold text-xs px-4 py-1.5 rounded uppercase tracking-wider transition-colors shadow-sm" data-i18n="clear">Clear</button>
                 </div>
 
-                <button id="btn-export" onclick="openExportModal()" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-6 py-2 rounded uppercase tracking-wider shadow-lg flex items-center gap-2 transition-colors border border-emerald-700">
-                    <span data-i18n="export">Export to Desktop</span>
-                </button>
+                <div class="flex gap-2">
+                    <button id="btn-show-graph" onclick="openLogChart()" class="bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs px-6 py-2 rounded uppercase tracking-wider shadow-lg transition-colors border border-indigo-700">SHOW GRAPH</button>
+                    <button id="btn-export" onclick="openExportModal()" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-6 py-2 rounded uppercase tracking-wider shadow-lg flex items-center gap-2 transition-colors border border-emerald-700">
+                        <span data-i18n="export">Export to Desktop</span>
+                    </button>
+                </div>
             </div>
             <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg overflow-auto flex-grow min-h-0">
                 <table class="w-full text-left text-sm whitespace-nowrap">
@@ -906,9 +939,20 @@ def get_gui():
                                         <span class="text-[10px] font-black text-fuchsia-500 uppercase tracking-widest">MANUAL</span>
                                     </div>
                                 </div>
-                                <div class="flex items-center gap-3 opacity-50 pointer-events-none transition-opacity" id="ao-ctrl-box-${i}">
-                                    <input type="range" id="ao-slider-${i}" min="4" max="20" step="0.1" value="4.0" oninput="document.getElementById('ao-val-${i}').innerText = parseFloat(this.value).toFixed(1); updateAoManual(${i})" class="flex-1 accent-fuchsia-500">
-                                    <div class="w-16 text-right font-mono font-black text-fuchsia-600 dark:text-fuchsia-400"><span id="ao-val-${i}">4.0</span> mA</div>
+                                <div class="flex flex-col gap-3 opacity-50 pointer-events-none transition-opacity" id="ao-ctrl-box-${i}">
+                                    <div class="flex items-center gap-3">
+                                        <button onclick="stepAoUI(${i}, -0.1)" class="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-700 rounded-full text-slate-600 dark:text-slate-300 font-black hover:bg-fuchsia-100 dark:hover:bg-fuchsia-900/50 hover:text-fuchsia-600 dark:hover:text-fuchsia-400 transition-colors shadow-sm border border-slate-300 dark:border-slate-600">-</button>
+                                        <input type="range" id="ao-slider-${i}" min="4" max="20" step="0.1" value="4.0" oninput="syncAoUI(${i})" class="flex-1 accent-fuchsia-500">
+                                        <button onclick="stepAoUI(${i}, 0.1)" class="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-700 rounded-full text-slate-600 dark:text-slate-300 font-black hover:bg-fuchsia-100 dark:hover:bg-fuchsia-900/50 hover:text-fuchsia-600 dark:hover:text-fuchsia-400 transition-colors shadow-sm border border-slate-300 dark:border-slate-600">+</button>
+                                        <div class="w-16 text-right font-mono font-black text-fuchsia-600 dark:text-fuchsia-400"><span id="ao-val-${i}">4.0</span> mA</div>
+                                    </div>
+                                    <div class="flex gap-2 justify-between mt-1">
+                                        <button onclick="setAoPreset(${i}, 4.0)" class="flex-1 py-1.5 bg-slate-200 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded text-xs font-bold text-slate-600 dark:text-slate-400 hover:border-fuchsia-500 hover:text-fuchsia-600 dark:hover:text-fuchsia-400 transition-colors shadow-sm">4</button>
+                                        <button onclick="setAoPreset(${i}, 8.0)" class="flex-1 py-1.5 bg-slate-200 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded text-xs font-bold text-slate-600 dark:text-slate-400 hover:border-fuchsia-500 hover:text-fuchsia-600 dark:hover:text-fuchsia-400 transition-colors shadow-sm">8</button>
+                                        <button onclick="setAoPreset(${i}, 12.0)" class="flex-1 py-1.5 bg-slate-200 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded text-xs font-bold text-slate-600 dark:text-slate-400 hover:border-fuchsia-500 hover:text-fuchsia-600 dark:hover:text-fuchsia-400 transition-colors shadow-sm">12</button>
+                                        <button onclick="setAoPreset(${i}, 16.0)" class="flex-1 py-1.5 bg-slate-200 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded text-xs font-bold text-slate-600 dark:text-slate-400 hover:border-fuchsia-500 hover:text-fuchsia-600 dark:hover:text-fuchsia-400 transition-colors shadow-sm">16</button>
+                                        <button onclick="setAoPreset(${i}, 20.0)" class="flex-1 py-1.5 bg-slate-200 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded text-xs font-bold text-slate-600 dark:text-slate-400 hover:border-fuchsia-500 hover:text-fuchsia-600 dark:hover:text-fuchsia-400 transition-colors shadow-sm">20</button>
+                                    </div>
                                 </div>
                             </div>
                             `);
@@ -1360,9 +1404,9 @@ def get_gui():
 
             const translations = {
                 en: {
-                    nav_dash: "Dashboard", nav_trends: "Trends", nav_logs: "Logs", nav_ctrl: "Control", nav_setup: "Setup", theme: "Theme", exit: "EXIT",
+                    nav_dash: "Monitoring", nav_trends: "Trends", nav_logs: "Data", nav_ctrl: "Control", nav_setup: "Setup", theme: "Theme", exit: "EXIT",
                     sys_status: "System Status", mini_trend: "MINI TREND", multi_trend: "MULTI-TREND ANALYSIS", show_all: "SHOW ALL LINES",
-                    log_5min: "5-Min Data", log_1hr: "1-Hour AVG", log_alarm: "Alarm History", export: "Export to Desktop",
+                    log_5min: "5-Min Data", log_1hr: "1-Hour AVG", log_alarm: "Alarm History", export: "Export to File",
                     manual_or: "Manual Relay Override",
                     dev_net: "Device Network Manager", io_setup: "I/O SETUP", add_sensor: "ADD SENSOR", change_pwd: "CHANGE PWD", ao_scaling: "4-20mA Scaling", relay_setup: "Relay Configuration",
                     export_title: "Advanced Data Export", export_dates: "1. Select Dates", export_sensors: "2. Select Sensors", cancel: "CANCEL", download_csv: "DOWNLOAD CSV",
@@ -1382,9 +1426,9 @@ def get_gui():
                     modbus_id_short: "ID", ch_short: "CH", add_action: "+ ADD NEW ACTION"
                 },
                 ko: {
-                    nav_dash: "대시보드", nav_trends: "트렌드", nav_logs: "로그", nav_ctrl: "제어", nav_setup: "설정", theme: "테마", exit: "종료",
+                    nav_dash: "감시화면", nav_trends: "트렌드", nav_logs: "자료조회", nav_ctrl: "제어", nav_setup: "설정", theme: "테마", exit: "종료",
                     sys_status: "시스템 상태", mini_trend: "미니 트렌드", multi_trend: "다중 트렌드 분석", show_all: "모든 라인 보기",
-                    log_5min: "5분 데이터", log_1hr: "1시간 평균", log_alarm: "알람 이력", export: "바탕화면 저장",
+                    log_5min: "5분 데이터", log_1hr: "1시간 평균", log_alarm: "알람 이력", export: "자료보내기",
                     manual_or: "수동 릴레이 제어",
                     dev_net: "장치 네트워크 관리", io_setup: "I/O 설정", add_sensor: "센서 추가", change_pwd: "비밀번호 변경", ao_scaling: "4-20mA 스케일링", relay_setup: "릴레이 채널 설정",
                     export_title: "데이터 추출", export_dates: "1. 날짜 선택", export_sensors: "2. 센서 선택", cancel: "취소", download_csv: "CSV 다운로드",
@@ -1589,6 +1633,31 @@ def get_gui():
                 }
                 
                 fetch(`/api/ao_manual?ch=${ch}&active=${isActive ? 1 : 0}&val=${val}`);
+            }
+            
+            // --- СИНХРОНИЗАЦИЯ НОВОГО UI ---
+            function syncAoUI(ch) {
+                const slider = document.getElementById('ao-slider-' + ch);
+                const valTxt = document.getElementById('ao-val-' + ch);
+                let val = parseFloat(slider.value);
+                valTxt.innerText = val.toFixed(1);
+                updateAoManual(ch);
+            }
+
+            function stepAoUI(ch, step) {
+                const slider = document.getElementById('ao-slider-' + ch);
+                let val = parseFloat(slider.value);
+                val += step;
+                if (val < 4) val = 4;
+                if (val > 20) val = 20;
+                slider.value = val;
+                syncAoUI(ch);
+            }
+
+            function setAoPreset(ch, val) {
+                const slider = document.getElementById('ao-slider-' + ch);
+                slider.value = val;
+                syncAoUI(ch);
             }
 
             let isAdmin = false;
@@ -2111,8 +2180,24 @@ def get_gui():
                 if (!configData.sensors) configData.sensors = {};
                 if (!configData.relay_actions) configData.relay_actions = {};
                 
-                const activeSensors = Object.entries(configData.sensors).filter(([k, v]) => v.enabled);
-                const count = activeSensors.length;
+                const activeSensors = Object.entries(configData.sensors || {}).filter(([k, v]) => v.enabled);
+                
+                // === МАГИЯ РАСЩЕПЛЕНИЯ UV254 ===
+                let displayCards = [];
+                activeSensors.forEach(([key, s]) => {
+                    if (s.type === 'uv254') {
+                        // Создаем 4 виртуальные карточки
+                        displayCards.push({ id: key, origKey: key, label: 'TOC', unit: s.unit || 'mg/L', color: s.color });
+                        displayCards.push({ id: key + '_cod', origKey: key, label: 'CODcr', unit: s.unit || 'mg/L', color: s.color });
+                        displayCards.push({ id: key + '_tb', origKey: key, label: 'TURBIDITY', unit: 'NTU', color: s.color });
+                        displayCards.push({ id: key + '_temp', origKey: key, label: 'TEMP', unit: '°C', color: s.color });
+                    } else {
+                        // Обычный датчик
+                        displayCards.push({ id: key, origKey: key, label: s.label, unit: s.unit, color: s.color });
+                    }
+                });
+
+                const count = displayCards.length;
                 
                 const grid = document.getElementById('dashboard-grid');
                 grid.innerHTML = '';
@@ -2126,11 +2211,11 @@ def get_gui():
                     grid.className = "grid gap-4 grid-cols-2 grid-rows-1 flex-grow min-h-0"; 
                     dashChartWrap.classList.remove('hidden');
                     dashChartWrap.style.display = 'flex';
-                } else if (count <= 4) {
+                } else if (count === 3 || count === 4) {
                     grid.className = "grid gap-4 grid-cols-2 grid-rows-2 flex-grow min-h-0";
                     dashChartWrap.classList.add('hidden');
                     dashChartWrap.style.display = 'none';
-                } else if (count <= 6) {
+                } else if (count === 5 || count === 6) {
                     grid.className = "grid gap-4 grid-cols-2 grid-rows-3 flex-grow min-h-0"; 
                     dashChartWrap.classList.add('hidden');
                     dashChartWrap.style.display = 'none';
@@ -2146,35 +2231,33 @@ def get_gui():
                 }
 
                 let valSize, unitSize, lblSize;
-                if (count === 1) { valSize = '22vh'; unitSize = '5vh'; lblSize = '3vh'; }
-                else if (count === 2) { valSize = '14vh'; unitSize = '4vh'; lblSize = '2.5vh'; }
-                else if (count <= 4) { valSize = '10vh'; unitSize = '3vh'; lblSize = '2vh'; }
-                else if (count <= 6) { valSize = '7vh'; unitSize = '2vh'; lblSize = '1.5vh'; }
-                else { valSize = '5vh'; unitSize = '1.5vh'; lblSize = '1.2vh'; }
+                if (count === 1) { valSize = '28vh'; unitSize = '6vh'; lblSize = '4vh'; }
+                else if (count === 2) { valSize = '16vh'; unitSize = '4.5vh'; lblSize = '3vh'; }
+                else if (count <= 4) { valSize = '12vh'; unitSize = '3.5vh'; lblSize = '2.5vh'; }
+                else if (count <= 6) { valSize = '10vh'; unitSize = '3vh'; lblSize = '2vh'; }
+                else { valSize = '6vh'; unitSize = '2vh'; lblSize = '1.5vh'; }
 
-                activeSensors.forEach(([key, s], index) => {
-                    const unit = s.unit || ""; 
-                    let extraHtml = '';
-                    if (s.type === 'uv254') {
-                        extraHtml = `
-                        <div class="absolute top-3 right-4 text-right font-bold text-slate-500 dark:text-slate-400" style="font-size: ${unitSize};">
-                            T: <span id="v-${key}-t" class="text-slate-800 dark:text-white">--</span> °C<br>
-                            Tb: <span id="v-${key}-tr" class="text-slate-800 dark:text-white">--</span> NTU
-                        </div>`;
-                    }
-                    
+                // Отрисовка сгенерированных карточек
+                displayCards.forEach((card, index) => {
                     let spanClass = "";
-                    if (count > 2 && count % 2 !== 0 && index === 0) {
+                    
+                    // 정중앙 정렬을 위한 3개, 5개일 때 첫 번째 카드 전체 너비(col-span-2) 설정
+                    if ((count === 3 && index === 0) || (count === 5 && index === 0)) {
                         spanClass = "col-span-2"; 
                     }
                     
                     grid.innerHTML += `
-                    <div id="card-${key}" onclick="focusChart('${key}')" class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg sensor-card relative overflow-hidden group flex items-center justify-center ${spanClass}">
-                        <div class="absolute top-3 left-4 font-black uppercase tracking-wider" style="color: ${s.color}; font-size: ${lblSize};">${s.label}</div>
-                        ${extraHtml}
+                    <div id="card-${card.id}" onclick="focusChart('${card.origKey}')" class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg sensor-card relative overflow-hidden group flex items-center justify-center ${spanClass}">
+                        <div class="absolute top-4 left-5 font-black uppercase tracking-wider" style="color: ${card.color}; font-size: ${lblSize};">${card.label}</div>
+                        
                         <div class="flex items-baseline justify-center">
-                            <p id="v-${key}" class="font-black text-slate-800 dark:text-white leading-none tracking-tighter" style="font-size: ${valSize};">--</p>
-                            <span class="text-slate-500 font-bold ml-3" style="font-size: ${unitSize};">${unit}</span>
+                            <p id="v-${card.id}" class="font-black text-slate-800 dark:text-white leading-none tracking-tighter transition-colors" style="font-size: ${valSize};">--</p>
+                            <span class="text-slate-500 font-bold ml-3" style="font-size: ${unitSize};">${card.unit}</span>
+                        </div>
+
+                        <div id="contam-box-${card.id}" class="absolute bottom-3 text-center hidden w-full cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800/50 py-1 transition-colors" onclick="event.stopPropagation(); promptMfgPwd('${card.origKey}')">
+                            <span class="text-xs font-bold text-slate-500">Sensor Contamination: </span> 
+                            <span id="contam-val-${card.id}" class="text-xs font-black text-rose-500">0%</span>
                         </div>
                     </div>`;
                 });
@@ -2446,18 +2529,51 @@ def get_gui():
                             const d_s = d.data[key];
                             if(!d_s) return;
                             
-                            const el = document.getElementById('v-' + key);
-                            if(el) el.innerText = d_s.val;
-                            if(s.type === 'uv254') {
-                                const elT = document.getElementById(`v-${key}-t`);
-                                const elTr = document.getElementById(`v-${key}-tr`);
-                                if(elT) elT.innerText = d_s.temp;
-                                if(elTr) elTr.innerText = d_s.turb;
-                            }
-                            
                             const isErr = d_s.status === 'ERR' || d_s.val === 'Err';
                             const statColor = isErr ? 'text-rose-500' : 'text-emerald-600 dark:text-emerald-400';
                             const dotColor = isErr ? 'bg-rose-500' : 'bg-emerald-500 animate-pulse';
+                            
+                            // --- ОБНОВЛЕНИЕ ЗАГРЯЗНЕНИЯ ---
+                            const subIds = s.type === 'uv254' ? [key, key+'_cod', key+'_tb', key+'_temp'] : [key];
+                            subIds.forEach(id => {
+                                const cBox = document.getElementById('contam-box-' + id);
+                                const cVal = document.getElementById('contam-val-' + id);
+                                if(cBox && cVal) {
+                                    if(s.contam && s.contam.enabled) {
+                                        cBox.classList.remove('hidden');
+                                        cVal.innerText = (d_s.contam_pct || 0) + '%';
+                                    } else {
+                                        cBox.classList.add('hidden');
+                                    }
+                                }
+                            });
+                            
+                            // === ОБНОВЛЕНИЕ РАСЩЕПЛЕННОГО UV254 ===
+                            if (s.type === 'uv254') {
+                                const els = [
+                                    { id: 'v-' + key, val: d_s.val },
+                                    { id: 'v-' + key + '_cod', val: d_s.cod },
+                                    { id: 'v-' + key + '_tb', val: d_s.turb },
+                                    { id: 'v-' + key + '_temp', val: d_s.temp }
+                                ];
+                                
+                                els.forEach(el => {
+                                    const domEl = document.getElementById(el.id);
+                                    if (domEl) {
+                                        domEl.innerText = el.val || '--';
+                                        if (isErr || el.val === 'Err') domEl.classList.add('text-rose-500');
+                                        else domEl.classList.remove('text-rose-500');
+                                    }
+                                });
+                            } else {
+                                // Обычный датчик
+                                const el = document.getElementById('v-' + key);
+                                if(el) {
+                                    el.innerText = d_s.val;
+                                    if (isErr) el.classList.add('text-rose-500');
+                                    else el.classList.remove('text-rose-500');
+                                }
+                            }
                             
                             let alarmText = 'NORMAL';
                             let alarmColor = 'text-slate-500';
@@ -2468,6 +2584,7 @@ def get_gui():
                             }
                             if(isErr) { alarmText = 'COMM FAULT'; alarmColor = 'text-rose-600 dark:text-rose-500 font-black'; }
 
+                            // В сайдбаре UV254 остается как один блок (ведь физически это 1 датчик с 1 реле и AO)
                             sidebarHTML += `
                             <div class="card p-3.5 rounded-lg flex flex-col gap-1 border bg-white dark:bg-transparent ${isErr ? 'border-rose-400 bg-rose-50 dark:border-rose-900/50 dark:bg-rose-950/10' : 'border-slate-300 dark:border-slate-800'} shrink-0">
                                 <div class="flex justify-between items-center mb-1 pb-2 border-b border-slate-300 dark:border-slate-700/50">
@@ -2584,6 +2701,163 @@ def get_gui():
                     btn.className = origClasses;
                 }, 3000);
             }
+            
+            // ==========================================
+            // ЭТАП 3: ГРАФИКИ ЛОГОВ И ИЗНОС ДАТЧИКОВ
+            // ==========================================
+            
+            // --- 1. ГРАФИК ЛОГОВ ---
+            document.body.insertAdjacentHTML('beforeend', `
+            <div id="log-chart-modal" class="modal-overlay fixed inset-0 bg-slate-900/80 hidden z-50 flex justify-center items-center p-8">
+                <div class="bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-slate-700 rounded-xl w-full h-full p-6 shadow-2xl flex flex-col">
+                    <div class="flex justify-between items-center mb-4 shrink-0">
+                        <h2 class="text-indigo-600 dark:text-indigo-400 font-black text-xl uppercase tracking-wider">DATA GRAPH</h2>
+                        <button onclick="document.getElementById('log-chart-modal').classList.add('hidden')" class="px-6 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300">CLOSE</button>
+                    </div>
+                    <div class="flex-grow relative min-h-0"><canvas id="logFullCanvas"></canvas></div>
+                </div>
+            </div>`);
+
+            let logFullChartInstance = null;
+            async function openLogChart() {
+                const btn = document.getElementById('btn-show-graph');
+                btn.innerText = "LOADING...";
+                
+                try {
+                    const res = await fetch(`/api/all?log_start=${filterStartDate}&log_end=${filterEndDate}`);
+                    const d = await res.json();
+                    const targetLog = d.logs[currentLogView];
+                    
+                    if(!targetLog || targetLog.rows.length === 0) {
+                        btn.innerText = "NO DATA";
+                        setTimeout(() => btn.innerText = "SHOW GRAPH", 2000);
+                        return;
+                    }
+
+                    document.getElementById('log-chart-modal').classList.remove('hidden');
+                    const ctx = document.getElementById('logFullCanvas').getContext('2d');
+                    if(logFullChartInstance) logFullChartInstance.destroy();
+
+                    // Парсим таблицу в массивы
+                    const labels = targetLog.rows.map(r => r[0].split(' ')[1] || r[0]); // Берем только время
+                    const datasets = [];
+                    const colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4'];
+
+                    for(let i=1; i<targetLog.headers.length; i++) {
+                        if(targetLog.headers[i].includes('SYS TEMP')) continue; // Пропускаем температуру
+                        datasets.push({
+                            label: targetLog.headers[i],
+                            data: targetLog.rows.map(r => parseFloat(r[i]) || null),
+                            borderColor: colors[i % colors.length],
+                            borderWidth: 2, tension: 0.1, pointRadius: 1
+                        });
+                    }
+
+                    logFullChartInstance = new Chart(ctx, {
+                        type: 'line',
+                        data: { labels: labels, datasets: datasets },
+                        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'top', labels:{color: isDark?'#cbd5e1':'#475569'} } }, scales: { x:{ticks:{color: isDark?'#64748b':'#94a3b8'}}, y:{grid:{color: isDark?'rgba(255,255,255,0.05)':'rgba(0,0,0,0.05)'}, ticks:{color: isDark?'#64748b':'#94a3b8'}} } }
+                    });
+                    
+                } catch(e) {}
+                btn.innerText = "SHOW GRAPH";
+            }
+
+            // --- 2. ПАРОЛЬ ПРОИЗВОДИТЕЛЯ И ОКНО ИЗНОСА ---
+            document.body.insertAdjacentHTML('beforeend', `
+            <div id="mfg-pwd-modal" class="modal-overlay fixed inset-0 bg-slate-900/60 hidden z-[60] flex justify-center items-center">
+                <div class="bg-white dark:bg-slate-900 border-t-4 border-t-rose-500 rounded-xl w-[350px] p-6 shadow-2xl">
+                    <h2 class="text-rose-600 font-black text-lg mb-4">MANUFACTURER LOGIN</h2>
+                    <input type="password" id="mfg-pwd-input" class="w-full bg-slate-50 dark:bg-slate-800 border rounded p-2 mb-4 dark:text-white" placeholder="Enter Mfg Password">
+                    <div class="flex justify-end gap-2">
+                        <button onclick="document.getElementById('mfg-pwd-modal').classList.add('hidden')" class="px-4 py-2 bg-slate-200 dark:bg-slate-700 rounded font-bold">CANCEL</button>
+                        <button onclick="verifyMfgPwd()" class="px-4 py-2 bg-rose-600 text-white rounded font-bold">ENTER</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="contam-setup-modal" class="modal-overlay fixed inset-0 bg-slate-900/60 hidden z-[60] flex justify-center items-center">
+                <div class="bg-white dark:bg-slate-900 border-t-4 border-t-emerald-500 rounded-xl w-[400px] p-6 shadow-2xl">
+                    <h2 class="text-emerald-600 font-black text-xl mb-4">CONTAMINATION SETUP</h2>
+                    <input type="hidden" id="contam-s-key">
+                    
+                    <div class="flex justify-between items-center mb-6 bg-slate-100 dark:bg-slate-800 p-3 rounded">
+                        <span class="font-bold dark:text-white text-sm">Enable Contamination Alert</span>
+                        <input type="checkbox" id="contam-enabled" class="w-5 h-5 accent-emerald-500">
+                    </div>
+                    
+                    <div class="mb-6">
+                        <label class="block text-sm font-bold text-slate-500 mb-2">Cycle (Months)</label>
+                        <select id="contam-months" class="w-full bg-slate-50 dark:bg-slate-800 border rounded p-2 font-bold dark:text-white">
+                            ${[1,2,3,4,5,6,7,8,9,10,11,12].map(m=>`<option value="${m}">${m} Months</option>`).join('')}
+                        </select>
+                    </div>
+
+                    <button onclick="resetContamTimer()" class="w-full py-2 mb-6 bg-amber-100 text-amber-700 hover:bg-amber-200 rounded font-black border border-amber-300">RESET TIMER (0%)</button>
+
+                    <div class="flex justify-end gap-2 border-t pt-4">
+                        <button onclick="document.getElementById('contam-setup-modal').classList.add('hidden')" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded font-bold text-slate-700 dark:text-white">CLOSE</button>
+                        <button onclick="saveContamSetup()" class="px-5 py-2 bg-emerald-600 text-white rounded font-bold">SAVE SETUP</button>
+                    </div>
+                </div>
+            </div>`);
+
+            let currentContamKey = null;
+            const MFG_PWD = "9999"; // Заводской пароль
+
+            function promptMfgPwd(key) {
+                currentContamKey = key;
+                document.getElementById('mfg-pwd-input').value = '';
+                document.getElementById('mfg-pwd-modal').classList.remove('hidden');
+                setTimeout(()=>document.getElementById('mfg-pwd-input').focus(), 100);
+            }
+
+            function verifyMfgPwd() {
+                const pwd = document.getElementById('mfg-pwd-input').value;
+                if(pwd === MFG_PWD) {
+                    document.getElementById('mfg-pwd-modal').classList.add('hidden');
+                    openContamSetup(currentContamKey);
+                } else {
+                    document.getElementById('mfg-pwd-input').value = '';
+                    customAlert(configData.lang === 'ko' ? "인가되지 않은 접근입니다! (비밀번호 오류)" : "Unauthorized Access! (Wrong Password)");
+                }
+            }
+
+            function openContamSetup(key) {
+                const s = configData.sensors[key];
+                document.getElementById('contam-s-key').value = key;
+                document.getElementById('contam-enabled').checked = s.contam ? s.contam.enabled : false;
+                document.getElementById('contam-months').value = s.contam ? s.contam.months : 3;
+                document.getElementById('contam-setup-modal').classList.remove('hidden');
+            }
+
+            function resetContamTimer() {
+                customConfirm(configData.lang==='ko'?'오염도 시간을 0%로 초기화 하시겠습니까?':'Reset contamination timer to 0%?', async () => {
+                    const key = document.getElementById('contam-s-key').value;
+                    if(!configData.sensors[key].contam) configData.sensors[key].contam = {};
+                    configData.sensors[key].contam.start_ts = Date.now() / 1000;
+                    await triggerSave();
+                    customAlert("Timer Reset Successful!");
+                });
+            }
+
+            async function saveContamSetup() {
+                const key = document.getElementById('contam-s-key').value;
+                if(!configData.sensors[key].contam) configData.sensors[key].contam = {};
+                
+                configData.sensors[key].contam.enabled = document.getElementById('contam-enabled').checked;
+                configData.sensors[key].contam.months = parseInt(document.getElementById('contam-months').value);
+                
+                // Если включили первый раз, ставим таймер
+                if(configData.sensors[key].contam.enabled && !configData.sensors[key].contam.start_ts) {
+                    configData.sensors[key].contam.start_ts = Date.now() / 1000;
+                }
+                
+                await triggerSave();
+                document.getElementById('contam-setup-modal').classList.add('hidden');
+                initDynamicUI();
+            }
+            
         </script>
     </body>
     </html>
