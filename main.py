@@ -84,6 +84,7 @@ def load_config():
                 if "relay_name" not in cfg: cfg["relay_name"] = "KM6063 Relay Module"
                 if "ao_name" not in cfg: cfg["ao_name"] = "KM6023 Analog Output"
                 if "sys_temp" not in cfg: cfg["sys_temp"] = {"sensor": "", "ch": 4, "min": 0, "max": 50}
+                if "export_path" not in cfg: cfg["export_path"] = ""
                 
                 if "relay_actions" not in cfg:
                     old_relays = cfg.pop("relays", {})
@@ -187,6 +188,20 @@ def read_with_retry(func, *args, retries=2):
         except:
             time.sleep(0.2) 
             if attempt == retries - 1: raise
+            
+def trim_csv_log(filepath, max_rows=50000):
+    if not os.path.exists(filepath): return
+    try:
+        if os.path.getsize(filepath) < 3 * 1024 * 1024: return 
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        if len(lines) > max_rows:
+            headers = lines[0]
+            keep = lines[-(max_rows-1):]
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(headers)
+                f.writelines(keep)
+    except: pass
 
 def write_csv_log(filepath, headers, row):
     is_new = not os.path.exists(filepath)
@@ -328,6 +343,7 @@ def modbus_worker():
                                 raw_val = decode_dcba(read_with_retry(instr.read_registers, 9730, 2, 3))
                         
                         val_num = None
+                        base_val = None
                         if raw_val is not None:
                             a_val = float(s.get("a", 1.0))
                             b_val = float(s.get("b", 0.0))
@@ -335,9 +351,9 @@ def modbus_worker():
                             
                             val_num = base_val
                             if s_type == "oil" and s_unit in ["mg/L", "ppm"]: val_num = base_val / 1000.0
-                        elif s_type == "mlss" and s_unit == "g/L": val_num = base_val / 1000.0
-                        elif s_type == "mlss" and s_unit == "%": val_num = base_val / 10000.0
-                        elif s_type == "ec" and s_unit == "mS/cm": val_num = base_val / 1000.0
+                            elif s_type == "mlss" and s_unit == "g/L": val_num = base_val / 1000.0
+                            elif s_type == "mlss" and s_unit == "%": val_num = base_val / 10000.0
+                            elif s_type == "ec" and s_unit == "mS/cm": val_num = base_val / 1000.0
                         
                         # --- ЛОГИКА ЗАГРЯЗНЕНИЯ (ИЗНОСА) ---
                         contam_cfg = s.get("contam", {})
@@ -346,7 +362,7 @@ def modbus_worker():
                         
                         if contam_cfg.get("enabled"):
                             elapsed = time.time() - contam_cfg.get("start_ts", time.time())
-                            total_sec = int(contam_cfg.get("months", 3)) * 30 * 86400 # 30 дней в месяце
+                            total_sec = int(contam_cfg.get("months", 3)) * 30 * 86400
                             if total_sec > 0:
                                 contam_pct = min(99, int((elapsed / total_sec) * 100))
                             if contam_pct >= 99:
@@ -365,12 +381,15 @@ def modbus_worker():
                             fmt = "{:.1f}" if s_type == "orp" else "{:.2f}"
                             sensor_data[key]["val"] = fmt.format(val_num)
                             if s_type == "uv254": sensor_data[key]["cod"] = fmt.format(val_num)
+                            
+                            # CSV 정합성: 항상 RAW Base Value 저장
                             sensor_data[key]["log_val"] = fmt.format(base_val)
                         
                         min_v = float(s.get("min", 0))
                         max_v = float(s.get("max", 100))
                         
                         if val_num is not None:
+                            # 1시간 평균도 RAW 데이터 기준으로 쌓음
                             if key not in hourly_buffer: hourly_buffer[key] = []
                             hourly_buffer[key].append(base_val)
                             
@@ -446,32 +465,26 @@ def modbus_worker():
                         target_ao = ao_manual[c]["val"] if is_manual else auto_ao_out.get(c, 4.0)
                         
                         out_val = int(target_ao * 1000)
-                        out_val = max(0, min(20000, out_val)) # Лимит 20mA
+                        out_val = max(0, min(20000, out_val))
                         
                         try:
-                            # Адреса каналов: 2, 3, 4, 5
                             reg_address = c + 2 
-                            # Отправляем по одному каналу (Функция 6), чтобы не перегружать чип
                             read_with_retry(instr_ao.write_register, reg_address, out_val, 0, 6, retries=1)
-                            
-                            # ВАЖНО: Даем микроконтроллеру модуля 50 мс на физическое изменение тока
                             time.sleep(0.05) 
                         except Exception: pass
             except Exception: pass
 
-            # === LOGS WRITING ===
+            # === LOGS WRITING (NOW SAVES KEYS AS HEADERS) ===
             if all_keys:
                 if now.minute % 5 == 0 and now.minute != last_5min_minute:
-                    headers = ["Time"] + [f"{config['sensors'][k]['label']} ({BASE_UNITS.get(config['sensors'][k].get('type'), '')})" for k in all_keys]
-                    headers.append("SYS TEMP (°C)")
+                    headers = ["Time"] + all_keys + ["sys_temp"]
                     row = [now.strftime("%Y-%m-%d %H:%M:00")] + [sensor_data.get(k, {}).get("log_val", "--") for k in all_keys]
                     row.append(sensor_data.get("sys_temp", "--"))
                     write_csv_log(LOG_5MIN, headers, row)
                     last_5min_minute = now.minute
 
                 if now.minute == 0 and now.hour != last_1hr_hour:
-                    headers = ["Time"] + [f"{config['sensors'][k]['label']} ({BASE_UNITS.get(config['sensors'][k].get('type'), '')} AVG)" for k in all_keys]
-                    headers.append("SYS TEMP (°C)")
+                    headers = ["Time"] + all_keys + ["sys_temp"]
                     row = [now.strftime("%Y-%m-%d %H:00:00")]
                     for k in all_keys:
                         vals = [v for v in hourly_buffer.get(k, []) if v is not None]
@@ -481,6 +494,9 @@ def modbus_worker():
                     row.append(sensor_data.get("sys_temp", "--"))
                     write_csv_log(LOG_1HR, headers, row)
                     last_1hr_hour = now.hour
+                    trim_csv_log(LOG_5MIN)
+                    trim_csv_log(LOG_1HR)
+                    trim_csv_log(LOG_ALARM)
 
         except Exception: pass
         time.sleep(0.5)
@@ -525,18 +541,51 @@ async def update_cfg(request: Request):
     global config
     new_config = await request.json()
     
-    old_keys = set(config.get("sensors", {}).keys())
-    new_keys = set(new_config.get("sensors", {}).keys())
+    old_keys = list(config.get("sensors", {}).keys())
+    new_keys = list(new_config.get("sensors", {}).keys())
     
     config = new_config
     save_config(config)
     
-    if old_keys != new_keys:
+    if set(old_keys) != set(new_keys):
         init_data_structures()
-        try:
-            if os.path.exists(LOG_5MIN): os.remove(LOG_5MIN)
-            if os.path.exists(LOG_1HR): os.remove(LOG_1HR)
-        except: pass
+        
+        # --- SMART CSV REBUILD (Защита истории) ---
+        def rebuild_csv(filepath, target_keys):
+            if not os.path.exists(filepath): return
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    rows = list(csv.reader(f))
+                if len(rows) < 2: return
+                
+                old_headers = rows[0]
+                new_headers = ["Time"] + target_keys + ["sys_temp"]
+                
+                # Ищем индексы старых колонок
+                idx_map = []
+                for nh in new_headers:
+                    if nh in old_headers:
+                        idx_map.append(old_headers.index(nh))
+                    else:
+                        idx_map.append(-1) # Для новых датчиков
+                        
+                # Переписываем файл с новыми колонками
+                with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(new_headers)
+                    for r in rows[1:]:
+                        if not r: continue
+                        new_r = []
+                        for idx in idx_map:
+                            if idx != -1 and idx < len(r):
+                                new_r.append(r[idx])
+                            else:
+                                new_r.append("--")
+                        writer.writerow(new_r)
+            except: pass
+
+        rebuild_csv(LOG_5MIN, new_keys)
+        rebuild_csv(LOG_1HR, new_keys)
         
     return {"status": "ok"}
 
@@ -576,6 +625,17 @@ def get_export_options(type: str):
             reader = csv.reader(f)
             headers = next(reader, [])
             dates = set()
+            
+            cols_info = []
+            for h in headers:
+                if h == "Time": cols_info.append({"key": h, "label": "Time"})
+                elif h == "sys_temp": cols_info.append({"key": h, "label": "SYS TEMP (°C)"})
+                elif h in config.get("sensors", {}):
+                    s = config["sensors"][h]
+                    cols_info.append({"key": h, "label": f"{s['label']} ({s.get('unit', '')})"})
+                else:
+                    cols_info.append({"key": h, "label": h})
+            
             for row in reader:
                 if row and len(row) > 0:
                     date_part = row[0].split(' ')[0]
@@ -583,7 +643,7 @@ def get_export_options(type: str):
         
         return {
             "status": "ok", 
-            "columns": headers, 
+            "columns": cols_info, 
             "dates": sorted(list(dates), reverse=True)
         }
     except Exception as e:
@@ -593,24 +653,17 @@ def get_export_options(type: str):
 async def export_execute(request: Request):
     payload = await request.json()
     log_type = payload.get("type", "5min")
-    sel_cols = payload.get("columns", [])
+    sel_cols = payload.get("columns", []) # 이제 key값 배열이 들어옴 ("Time", "s_1" 등)
     sel_dates = payload.get("dates", [])
+    destination = payload.get("path", "") 
     
     file_map = {"5min": LOG_5MIN, "1hr": LOG_1HR, "alarm": LOG_ALARM}
     target_file = file_map.get(log_type)
     
-    if not target_file or not os.path.exists(target_file):
+    if not target_file or not os.path.exists(target_file) or not destination:
         return {"status": "error"}
         
     try:
-        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-        if not os.path.exists(desktop_path): 
-            desktop_path = os.path.expanduser("~") 
-            
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        export_name = f"Export_{log_type}_{timestamp}.csv"
-        destination = os.path.join(desktop_path, export_name)
-        
         with open(target_file, 'r', encoding='utf-8') as fin, open(destination, 'w', newline='', encoding='utf-8') as fout:
             reader = csv.reader(fin)
             writer = csv.writer(fout)
@@ -624,13 +677,49 @@ async def export_execute(request: Request):
             if not col_indices:
                 return {"status": "error", "message": "No columns selected"}
             
-            writer.writerow([headers[i] for i in col_indices])
+            # 1. 파일용 헤더(Label + Unit) 생성
+            out_headers = []
+            for i in col_indices:
+                h = headers[i]
+                if h == "Time": out_headers.append("Time")
+                elif h == "sys_temp": out_headers.append("SYS TEMP (°C)")
+                elif h in config.get("sensors", {}):
+                    s = config["sensors"][h]
+                    out_headers.append(f"{s['label']} ({s.get('unit', '')})")
+                else: out_headers.append(h)
+                
+            writer.writerow(out_headers)
             
+            # 2. 데이터 변환 및 쓰기
             for row in reader:
                 if not row: continue
                 date_part = row[0].split(' ')[0]
                 if date_part in sel_dates:
-                    writer.writerow([row[i] for i in col_indices if i < len(row)])
+                    new_row = []
+                    for i in col_indices:
+                        h = headers[i]
+                        val_str = row[i] if i < len(row) else ""
+                        
+                        if h in config.get("sensors", {}) and val_str not in ["", "--", "Err", "Off", "NaN"]:
+                            try:
+                                raw_val = float(val_str)
+                                s = config["sensors"][h]
+                                s_type = s.get("type")
+                                s_unit = s.get("unit", "")
+                                val_num = raw_val
+                                
+                                if s_type == "oil" and s_unit in ["mg/L", "ppm"]: val_num = raw_val / 1000.0
+                                elif s_type == "mlss" and s_unit == "g/L": val_num = raw_val / 1000.0
+                                elif s_type == "mlss" and s_unit == "%": val_num = raw_val / 10000.0
+                                elif s_type == "ec" and s_unit == "mS/cm": val_num = raw_val / 1000.0
+                                
+                                fmt = "{:.1f}" if s_type == "orp" else "{:.2f}"
+                                new_row.append(fmt.format(val_num))
+                            except:
+                                new_row.append(val_str)
+                        else:
+                            new_row.append(val_str)
+                    writer.writerow(new_row)
                     
         return {"status": "ok", "path": destination}
     except Exception as e:
@@ -878,34 +967,34 @@ def get_gui():
         </main>
 
         <main id="tab-logs" class="p-6 hidden flex-grow overflow-hidden flex flex-col min-h-0 gap-4">
-            <div class="flex justify-between items-center shrink-0 flex-wrap gap-4">
-                <div class="flex gap-2">
+            <div class="flex flex-col xl:flex-row justify-between items-start xl:items-center shrink-0 gap-4 w-full">
+                
+                <div class="flex flex-wrap items-center gap-2 shrink-0">
                     <button onclick="setLogView('5min')" id="btn-v-5min" class="log-tab-btn active px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400" data-i18n="log_5min">5-Min Data</button>
                     <button onclick="setLogView('1hr')" id="btn-v-1hr" class="log-tab-btn px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400" data-i18n="log_1hr">1-Hour AVG</button>
                     <button onclick="setLogView('alarm')" id="btn-v-alarm" class="log-tab-btn px-4 py-2 rounded font-bold text-xs uppercase transition-colors border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400" data-i18n="log_alarm">Alarm History</button>
+                    
+                    <div class="w-px h-6 bg-slate-300 dark:bg-slate-700 mx-1 hidden sm:block"></div>
+                    
+                    <button id="btn-show-graph" onclick="openLogChart()" class="bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs px-5 py-2 rounded uppercase tracking-wider shadow-sm transition-colors border border-indigo-700 whitespace-nowrap" data-i18n="show_graph">SHOW GRAPH</button>
+                    <button id="btn-export" onclick="openExportModal()" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-5 py-2 rounded uppercase tracking-wider shadow-sm transition-colors border border-emerald-700 whitespace-nowrap" data-i18n="export">EXPORT TO FILE</button>
                 </div>
                 
-                <div class="flex items-center gap-3 bg-white dark:bg-slate-800 p-2 rounded-lg border border-slate-300 dark:border-slate-700 shadow-sm">
-                    <div class="flex items-center gap-2">
-                        <span class="text-xs font-bold text-slate-500 uppercase tracking-widest" data-i18n="start_date">Start Date</span>
+                <div class="flex items-center gap-2 bg-white dark:bg-slate-800 p-1.5 rounded-lg border border-slate-300 dark:border-slate-700 shadow-sm shrink-0">
+                    <div class="flex items-center gap-1.5 pl-1">
+                        <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest whitespace-nowrap" data-i18n="start_date">Start Date</span>
                         <input type="date" id="log-start-date" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded text-xs px-2 py-1.5 dark:text-white outline-none focus:border-cyan-500 font-bold text-slate-700">
                     </div>
-                    <span class="text-slate-400 font-bold">-</span>
-                    <div class="flex items-center gap-2">
-                        <span class="text-xs font-bold text-slate-500 uppercase tracking-widest" data-i18n="end_date">End Date</span>
+                    <span class="text-slate-400 font-bold px-1">-</span>
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest whitespace-nowrap" data-i18n="end_date">End Date</span>
                         <input type="date" id="log-end-date" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded text-xs px-2 py-1.5 dark:text-white outline-none focus:border-cyan-500 font-bold text-slate-700">
                     </div>
-                    <button onclick="applyLogFilter()" class="bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs px-4 py-1.5 rounded uppercase tracking-wider transition-colors shadow-sm ml-1" data-i18n="search">Search</button>
-                    <button onclick="clearLogFilter()" class="bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-white font-bold text-xs px-4 py-1.5 rounded uppercase tracking-wider transition-colors shadow-sm" data-i18n="clear">Clear</button>
-                </div>
-
-                <div class="flex gap-2">
-                    <button id="btn-show-graph" onclick="openLogChart()" class="bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs px-6 py-2 rounded uppercase tracking-wider shadow-lg transition-colors border border-indigo-700">SHOW GRAPH</button>
-                    <button id="btn-export" onclick="openExportModal()" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-6 py-2 rounded uppercase tracking-wider shadow-lg flex items-center gap-2 transition-colors border border-emerald-700">
-                        <span data-i18n="export">Export to Desktop</span>
-                    </button>
+                    <button onclick="applyLogFilter()" class="bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-[10px] px-3 py-1.5 rounded uppercase tracking-wider transition-colors shadow-sm ml-1 whitespace-nowrap" data-i18n="search">Search</button>
+                    <button onclick="clearLogFilter()" class="bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-white font-bold text-[10px] px-3 py-1.5 rounded uppercase tracking-wider transition-colors shadow-sm whitespace-nowrap" data-i18n="clear">Clear</button>
                 </div>
             </div>
+            
             <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg overflow-auto flex-grow min-h-0">
                 <table class="w-full text-left text-sm whitespace-nowrap">
                     <thead id="log-head" class="sticky top-0 z-10 shadow-sm"></thead>
@@ -1337,8 +1426,239 @@ def get_gui():
                 </div>
             </div>
         </div>
+        
+        <!-- ДОБАВЛЕНО: ОКНА ГРАФИКА И ЗАГРЯЗНЕНИЯ -->
+        <div id="log-chart-modal" class="modal-overlay fixed inset-0 bg-slate-900/80 hidden z-50 flex justify-center items-center p-8">
+            <div class="bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-slate-700 rounded-xl w-full h-full p-6 shadow-2xl flex flex-col">
+                <div class="flex justify-between items-center mb-4 shrink-0">
+                    <h2 class="text-indigo-600 dark:text-indigo-400 font-black text-xl uppercase tracking-wider" data-i18n="data_graph">DATA GRAPH</h2>
+                    <button onclick="document.getElementById('log-chart-modal').classList.add('hidden')" class="px-6 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300" data-i18n="close">CLOSE</button>
+                </div>
+                <div class="flex-grow relative min-h-0"><canvas id="logFullCanvas"></canvas></div>
+            </div>
+        </div>
+
+        <div id="mfg-pwd-modal" class="modal-overlay fixed inset-0 bg-slate-900/60 hidden z-[60] flex justify-center items-center">
+            <div class="bg-white dark:bg-slate-900 border-t-4 border-t-rose-500 rounded-xl w-[350px] p-6 shadow-2xl">
+                <h2 class="text-rose-600 font-black text-sm mb-4 leading-relaxed break-keep" data-i18n="mfg_login">MANUFACTURER LOGIN</h2>
+                <input type="password" id="mfg-pwd-input" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded p-2.5 mb-4 text-slate-900 dark:text-white focus:outline-none focus:border-rose-500" placeholder="****">
+                <div class="flex justify-end gap-2">
+                    <button onclick="document.getElementById('mfg-pwd-modal').classList.add('hidden')" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 transition-colors rounded text-sm font-bold text-slate-800 dark:text-white" data-i18n="cancel">CANCEL</button>
+                    <button onclick="verifyMfgPwd()" class="px-5 py-2 bg-rose-600 hover:bg-rose-500 transition-colors text-white rounded text-sm font-bold shadow-sm" data-i18n="enter">ENTER</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="contam-setup-modal" class="modal-overlay fixed inset-0 bg-slate-900/60 hidden z-[60] flex justify-center items-center">
+            <div class="bg-white dark:bg-slate-900 border-t-4 border-t-emerald-500 rounded-xl w-[400px] p-6 shadow-2xl">
+                <h2 class="text-emerald-600 font-black text-xl mb-4" data-i18n="contam_setup">CONTAMINATION SETUP</h2>
+                <input type="hidden" id="contam-s-key">
+                <div class="flex justify-between items-center mb-6 bg-slate-100 dark:bg-slate-800 p-3 rounded">
+                    <span class="font-bold dark:text-white text-sm" data-i18n="contam_enable">Enable Contamination Alert</span>
+                    <input type="checkbox" id="contam-enabled" class="w-5 h-5 accent-emerald-500">
+                </div>
+                <div class="mb-6">
+                    <label class="block text-sm font-bold text-slate-500 mb-2" data-i18n="contam_cycle">Cycle (Months)</label>
+                    <select id="contam-months" class="w-full bg-slate-50 dark:bg-slate-800 border rounded p-2 font-bold dark:text-black">
+                    </select>
+                </div>
+                <button onclick="resetContamTimer()" class="w-full py-2 mb-6 bg-amber-100 text-amber-700 hover:bg-amber-200 rounded font-black border border-amber-300" data-i18n="reset_timer">RESET TIMER (0%)</button>
+                <div class="flex justify-end gap-2 border-t pt-4">
+                    <button onclick="document.getElementById('contam-setup-modal').classList.add('hidden')" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded font-bold text-slate-700 dark:text-white" data-i18n="close">CLOSE</button>
+                    <button onclick="saveContamSetup()" class="px-5 py-2 bg-emerald-600 text-white rounded font-bold" data-i18n="save_setup">SAVE SETUP</button>
+                </div>
+            </div>
+        </div>
 
         <script>
+            // =========================================================
+            // 🔥 ADVANCED SMART ON-SCREEN KEYBOARD (OSK) with Preview
+            // =========================================================
+            const KioskBoard = {
+                activeInput: null,
+                mode: 'num', 
+                isShift: false,
+
+                init() {
+                    // --- CSS стили для клавиатуры и предпросмотра ---
+                    const stylesHTML = `
+                    <style>
+                        #osk-wrapper .osk-btn {
+                            flex: 1; height: 3.8rem; display: flex; align-items: center; justify-content: center;
+                            font-weight: 700; border-radius: 0.375rem; border-width: 1px; transition: all 150ms ease-in-out;
+                            cursor: pointer; user-select: none; font-size: 1.25rem;
+                        }
+                        
+                        /* Светлая тема (По умолчанию) */
+                        .osk-btn { background-color: #ffffff; color: #1e293b; border-color: #cbd5e1; }
+                        .osk-btn:hover { background-color: #f1f5f9; }
+                        .osk-btn:active { background-color: #06b6d4; color: #ffffff; }
+                        
+                        /* Темная тема (через класс .dark) */
+                        .dark .osk-btn { background-color: #334155; color: #ffffff; border-color: #475569; }
+                        .dark .osk-btn:hover { background-color: #475569; }
+                        .dark .osk-btn:active { background-color: #0891b2; color: #ffffff; }
+
+                        /* ENTER Кнопка */
+                        #osk-wrapper .osk-btn-enter { background-color: #0891b2; color: #ffffff; border-color: #0e7490; font-weight: 900; font-size: 0.8rem; letter-spacing: 0.1em; }
+                        #osk-wrapper .osk-btn-enter:hover { background-color: #06b6d4; }
+                        #osk-wrapper .osk-btn-enter:active { background-color: #22d3ee; }
+
+                        /* Shift Кнопка (активная) */
+                        #osk-wrapper .osk-btn-shift-active { background-color: #cffafe; color: #0891b2; border-color: #22d3ee; }
+                        .dark #osk-wrapper .osk-btn-shift-active { background-color: #0c4a6e; color: #67e8f9; border-color: #0e7490; }
+
+                        /* Danger Кнопки (Back, CLR) */
+                        #osk-wrapper .osk-btn-danger { background-color: #fee2e2; color: #dc2626; border-color: #fecaca; }
+                        .dark #osk-wrapper .osk-btn-danger { background-color: #4c1d1d; color: #f87171; border-color: #7f1d1d; }
+
+                        /* --- Поле предпросмотра (Preview) --- */
+                        #osk-preview {
+                            font-family: 'Montserrat', sans-serif; font-weight: 700; font-size: 1.5rem;
+                            padding: 0.5rem 1.25rem; border-radius: 0.375rem; border-width: 1px;
+                            flex: 1; margin: 0 1rem; box-shadow: inset 0 2px 4px rgba(0,0,0,0.1); outline: none;
+                            background-color: #ffffff; color: #111827; border-color: #cbd5e1;
+                        }
+                        .dark #osk-preview { background-color: #030712; color: #06b6d4; border-color: #334155; text-shadow: 0 0 10px rgba(6,182,212,0.3); }
+
+                        /* CLOSE Кнопка (на панели) */
+                        #osk-wrapper .osk-btn-close {
+                            text-transform: uppercase; font-weight: 900; font-size: 0.8rem; padding: 0.6rem 1.5rem;
+                            background-color: #fee2e2; color: #dc2626; border-color: #fecaca; border-radius: 0.375rem; border-width: 1px; cursor: pointer;
+                        }
+                        .dark #osk-wrapper .osk-btn-close { background-color: #4c1d1d; color: #f87171; border-color: #7f1d1d; }
+                    </style>`;
+                    document.body.insertAdjacentHTML('beforeend', stylesHTML);
+
+                    const html = `
+                    <div id="osk-bg" class="fixed inset-0 bg-transparent hidden z-[199]" onclick="KioskBoard.hide()"></div>
+                    <div id="osk-wrapper" class="fixed bottom-0 left-0 w-full bg-slate-200 dark:bg-slate-900 border-t border-slate-300 dark:border-slate-700 shadow-[0_-10px_40px_rgba(0,0,0,0.3)] z-[200] transform translate-y-full transition-transform duration-300 hidden select-none pb-4">
+                        <div class="flex justify-between items-center bg-slate-300 dark:bg-slate-950 px-4 py-2.5 border-b border-slate-400 dark:border-slate-800">
+                            <span class="text-slate-600 dark:text-slate-400 font-black text-sm tracking-widest shrink-0" id="osk-title">KEYBOARD</span>
+                            
+                            <input type="text" id="osk-preview" readonly placeholder="Enter value...">
+                            <button onclick="KioskBoard.hide()" class="osk-btn-close">CLOSE (ENTER)</button>
+                        </div>
+                        <div id="osk-keys" class="p-2 gap-1.5 flex flex-col mt-2 max-w-5xl mx-auto w-full"></div>
+                    </div>`;
+                    document.body.insertAdjacentHTML('beforeend', html);
+
+                    // Глобальный перехватчик фокуса
+                    document.addEventListener('focusin', (e) => {
+                        if(e.target.tagName === 'INPUT' && !['checkbox', 'radio', 'color', 'date'].includes(e.target.type)) {
+                            // Игнорируем фокус на самом поле предпросмотра
+                            if(e.target.id === 'osk-preview') return;
+
+                            if(e.target.type === 'number' || e.target.id.includes('pwd') || e.target.classList.contains('no-spin')) {
+                                KioskBoard.show(e.target, 'num');
+                            } else {
+                                KioskBoard.show(e.target, 'en');
+                            }
+                        }
+                    });
+                },
+
+                show(input, mode) {
+                    this.activeInput = input;
+                    this.mode = mode;
+                    this.isShift = false;
+                    
+                    // --- 1. Обновить поле предпросмотра при открытии ---
+                    const preview = document.getElementById('osk-preview');
+                    if(preview) {
+                        preview.value = input.value;
+                        preview.type = input.type; // Зеркалим тип (password -> ***)
+                        // Placeholder
+                        preview.placeholder = mode === 'num' ? 'Enter numbers...' : 'Enter text...';
+                    }
+                    // ------------------------------------------------
+
+                    this.render();
+                    
+                    document.getElementById('osk-bg').classList.remove('hidden');
+                    const wrapper = document.getElementById('osk-wrapper');
+                    wrapper.classList.remove('hidden');
+                    setTimeout(() => wrapper.classList.remove('translate-y-full'), 10);
+                },
+
+                hide() {
+                    if (this.activeInput) {
+                        this.activeInput.blur(); 
+                        this.activeInput = null;
+                    }
+                    
+                    // --- 2. Очистить поле предпросмотра при закрытии ---
+                    const preview = document.getElementById('osk-preview');
+                    if(preview) preview.value = '';
+                    // ------------------------------------------------
+
+                    document.getElementById('osk-bg').classList.add('hidden');
+                    const wrapper = document.getElementById('osk-wrapper');
+                    wrapper.classList.add('translate-y-full');
+                    setTimeout(() => wrapper.classList.add('hidden'), 300);
+                },
+
+                render() {
+                    const container = document.getElementById('osk-keys');
+                    container.innerHTML = '';
+                    document.getElementById('osk-title').innerText = this.mode === 'num' ? 'NUM PAD' : 'ENGLISH OSK';
+                    
+                    // (Логика layoutData осталась старой, пропущу для краткости)
+                    const rowsFull = [['1','2','3','4','5','6','7','8','9','0','-','+','Back:1.5'],['q','w','e','r','t','y','u','i','o','p','[',']'],['a','s','d','f','g','h','j','k','l',':',';','Enter:1.5'],['Shift:1.5','z','x','c','v','b','n','m',',','.','/','Shift:1.5'],['Space:5']];
+                    const rowsShift = [['!','@','#','$','%','^','&','*','(',')','_','=','Back:1.5'],['Q','W','E','R','T','Y','U','I','O','P','{','}'],['A','S','D','F','G','H','J','K','L','"',"'",'Enter:1.5'],['Shift:1.5','Z','X','C','V','B','N','M','<','>','?','Shift:1.5'],['Space:5']];
+                    const rowsNum = [['7','8','9','Back:1.5'],['4','5','6','CLR:1.5'],['1','2','3','Enter:1.5'],['0','-','.','Space:1.5']];
+
+                    const layoutData = this.mode === 'num' ? rowsNum : (this.isShift ? rowsShift : rowsFull);
+
+                    layoutData.forEach(row => {
+                        const rowDiv = document.createElement('div');
+                        rowDiv.className = 'flex justify-center gap-1.5 w-full';
+                        row.forEach(keyDef => {
+                            let [key, flex] = keyDef.split(':');
+                            flex = flex || '1';
+                            const btn = document.createElement('button');
+                            btn.className = 'osk-btn'; // Используем новый CSS класс
+                            btn.style.flex = flex;
+                            
+                            if (key === 'Space') { btn.innerHTML = '&#9251;'; } 
+                            else if (key === 'Back' || key === 'CLR') { btn.innerHTML = key === 'Back' ? '&#9003;' : 'CLR'; btn.classList.add('osk-btn-danger'); } 
+                            else if (key === 'Enter') { btn.innerHTML = 'ENTER'; btn.classList.add('osk-btn-enter'); } 
+                            else if (key === 'Shift') { btn.innerHTML = '&#8679;'; if (this.isShift) btn.classList.add('osk-btn-shift-active'); } 
+                            else { btn.innerText = key; }
+
+                            btn.onmousedown = (e) => { e.preventDefault(); this.handleKey(key); };
+                            rowDiv.appendChild(btn);
+                        });
+                        container.appendChild(rowDiv);
+                    });
+                },
+
+                handleKey(key) {
+                    if(!this.activeInput) return;
+                    
+                    if(key === 'Shift') { this.isShift = !this.isShift; this.render(); return; }
+                    if(key === 'Enter') { this.hide(); if (this.activeInput.id === 'admin-pwd-input') verifyAdmin(); if (this.activeInput.id === 'mfg-pwd-input') verifyMfgPwd(); return; }
+
+                    let val = this.activeInput.value;
+
+                    if(key === 'CLR') { val = ''; } 
+                    else if(key === 'Back') { val = val.slice(0, -1); } 
+                    else if(key === 'Space') { val += ' '; } 
+                    else { val += key; }
+                    
+                    this.activeInput.value = val;
+                    
+                    // --- 3. НЕВЕРОЯТНО ВАЖНО: Зеркалим ввод в предпросмотр ---
+                    const preview = document.getElementById('osk-preview');
+                    if(preview) preview.value = val;
+                    // -------------------------------------------------------
+
+                    this.activeInput.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+            };
+            KioskBoard.init();
+            // =========================================================
+            
             // --- CUSTOM DIALOG FUNCTIONS ---
             function customAlert(msg) {
                 document.getElementById('custom-alert-msg').innerText = msg;
@@ -1360,6 +1680,9 @@ def get_gui():
                 document.getElementById('custom-confirm-msg').innerText = msg;
                 document.getElementById('custom-confirm-title').innerText = (configData && configData.lang === 'ko') ? "경고" : "Warning";
                 document.getElementById('custom-confirm-btn').innerText = (configData && configData.lang === 'ko') ? "확인" : "CONFIRM";
+                
+                const cancelBtn = document.querySelector('#custom-confirm-box button[onclick="closeCustomConfirm()"]');
+                if(cancelBtn) cancelBtn.innerText = (configData && configData.lang === 'ko') ? "취소" : "CANCEL";
                 
                 currentConfirmCallback = callback;
                 
@@ -1413,7 +1736,7 @@ def get_gui():
                     admin_login: "Admin Login", password: "PASSWORD", unlock: "UNLOCK", new_pwd: "NEW PASSWORD", save: "SAVE", close: "CLOSE", lock: "LOCK",
                     sw_cal: "1. HMI Software (y = A*x + B)", hw_cal: "2. Sensor Hardware (Modbus)", save_hw_cal: "SAVE HW CAL",
                     clean_title: "CLEANING SETUP", ctrl_mode: "Control Mode", test_now: "TEST NOW",
-                    btn_cal: "CALIBRATION", btn_clean: "CLEANING", cal_title: "CALIBRATION",
+                    btn_cal: "CALIBRATION", btn_contam: "CONTAM", btn_clean: "CLEANING", cal_title: "CALIBRATION",
                     sensor_type: "SENSOR TYPE", unit_label: "UNIT", modbus_id: "MODBUS ID (1-247)", display_label: "DISPLAY LABEL", chart_color: "CHART COLOR",
                     relay_module_title: "DEFAULT RELAY ID", ao_module_title: "ANALOG OUTPUT ID",
                     interval_min: "Interval (Minutes)", duration_sec: "Duration (Seconds)", relay_channel: "Relay Channel",
@@ -1423,7 +1746,10 @@ def get_gui():
                     sys_temp_setup: "Master Temperature Setup", sys_temp: "SYSTEM TEMP",
                     start_date: "Start Date", end_date: "End Date", search: "Search", clear: "Clear", no_relays: "No active relays",
                     io_module_type: "I/O Module (KM60xx Relay/AO)", manual_ao: "Manual Analog Output",
-                    modbus_id_short: "ID", ch_short: "CH", add_action: "+ ADD NEW ACTION"
+                    modbus_id_short: "ID", ch_short: "CH", add_action: "+ ADD NEW ACTION",
+                    show_graph: "SHOW GRAPH", data_graph: "DATA GRAPH",
+                    contam_label: "Contamination: ", contam_setup: "CONTAMINATION SETUP",
+                    contam_enable: "Enable Contamination Alert", contam_cycle: "Cycle (Months)", reset_timer: "RESET TIMER (0%)", save_setup: "SAVE SETUP", mfg_login: "WARNING: Arbitrary changes may cause system failure. Contact Manufacturer.", enter: "ENTER", off: "OFF"
                 },
                 ko: {
                     nav_dash: "감시화면", nav_trends: "트렌드", nav_logs: "자료조회", nav_ctrl: "제어", nav_setup: "설정", theme: "테마", exit: "종료",
@@ -1435,7 +1761,7 @@ def get_gui():
                     admin_login: "관리자 로그인", password: "비밀번호", unlock: "잠금해제", new_pwd: "새 비밀번호", save: "저장", close: "닫기", lock: "잠금",
                     sw_cal: "1. HMI 소프트웨어 (y = A*x + B)", hw_cal: "2. 센서 하드웨어 (모드버스)", save_hw_cal: "하드웨어 저장",
                     clean_title: "세정(Cleaning) 설정", ctrl_mode: "제어 모드", test_now: "지금 테스트",
-                    btn_cal: "교정 (CAL)", btn_clean: "세정 (CLEAN)", cal_title: "센서 교정",
+                    btn_cal: "교정 (CAL)", btn_contam: "오염도", btn_clean: "세정 (CLEAN)", cal_title: "센서 교정",
                     sensor_type: "센서 종류", unit_label: "단위", modbus_id: "모드버스 ID (1-247)", display_label: "표시 이름", chart_color: "차트 색상",
                     relay_module_title: "기본 릴레이 ID", ao_module_title: "아날로그 출력 ID",
                     interval_min: "작동 주기 (분)", duration_sec: "작동 시간 (초)", relay_channel: "릴레이 채널",
@@ -1445,7 +1771,10 @@ def get_gui():
                     sys_temp_setup: "시스템 온도 설정 (마스터)", sys_temp: "시스템 온도",
                     start_date: "시작일", end_date: "종료일", search: "조회", clear: "초기화", no_relays: "활성화된 릴레이가 없습니다",
                     io_module_type: "I/O 모듈 (KM60xx 릴레이/AO)", manual_ao: "수동 아날로그 출력 테스트",
-                    modbus_id_short: "ID", ch_short: "CH", add_action: "+ 새 동작 추가"
+                    modbus_id_short: "ID", ch_short: "CH", add_action: "+ 새 동작 추가",
+                    show_graph: "그래프 보기", data_graph: "데이터 그래프",
+                    contam_label: "센서 오염도: ", contam_setup: "오염도 알람 설정",
+                    contam_enable: "오염도 알람 사용", contam_cycle: "교체 주기 (개월)", reset_timer: "시간 초기화 (0%)", save_setup: "설정 저장", mfg_login: "임의적으로 조작시 문제가 발생할 수 있으니 제조사 연락바랍니다.", enter: "확인", off: "꺼짐"
                 }
             };
 
@@ -1482,7 +1811,7 @@ def get_gui():
                 filterEndDate = '';
                 update();
             }
-
+            
             function updateNewSensorUnits() {
                 const type = document.getElementById('new-type').value;
                 const unitSelect = document.getElementById('new-unit');
@@ -1836,11 +2165,11 @@ def get_gui():
                     
                     let colsHtml = '';
                     data.columns.forEach(c => {
-                        if(c === 'Time') return; 
+                        if(c.key === 'Time') return; 
                         colsHtml += `
                         <label class="flex items-center gap-3 p-2 hover:bg-slate-200 dark:hover:bg-slate-700 rounded cursor-pointer transition-colors">
-                            <input type="checkbox" class="export-col-cb w-4 h-4 text-emerald-600 rounded border-gray-300 focus:ring-emerald-500" value="${c}" checked>
-                            <span class="text-sm font-bold text-slate-700 dark:text-slate-300">${c}</span>
+                            <input type="checkbox" class="export-col-cb w-4 h-4 text-emerald-600 rounded border-gray-300 focus:ring-emerald-500" value="${c.key}" checked>
+                            <span class="text-sm font-bold text-slate-700 dark:text-slate-300">${c.label}</span>
                         </label>`;
                     });
                     document.getElementById('export-cols-container').innerHTML = colsHtml;
@@ -1879,18 +2208,36 @@ def get_gui():
                     return;
                 }
                 
+                if (!window.pywebview || !window.pywebview.api) {
+                    customAlert("System API not ready.");
+                    return;
+                }
+
+                const now = new Date();
+                const pad = (n) => n.toString().padStart(2, '0');
+                const timestamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
+                const defaultFilename = `Export_${currentLogView}_${timestamp}.csv`;
+
+                btn.innerText = "SELECT FOLDER...";
+                const destPath = await window.pywebview.api.save_file_dialog(defaultFilename);
+
+                if (!destPath) {
+                    btn.innerText = origText; 
+                    return;
+                }
+                
                 btn.innerText = "SAVING...";
                 
                 try {
                     const res = await fetch('/api/export_execute', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ type: currentLogView, dates: selectedDates, columns: selectedCols })
+                        body: JSON.stringify({ type: currentLogView, dates: selectedDates, columns: selectedCols, path: destPath })
                     });
                     const data = await res.json();
                     
                     if (data.status === 'ok') {
-                        btn.innerText = "SAVED TO DESKTOP";
+                        btn.innerText = "FILE SAVED!";
                         btn.classList.replace('bg-emerald-600', 'bg-cyan-600');
                         setTimeout(() => { closeExportModal(); btn.innerText = origText; btn.classList.replace('bg-cyan-600', 'bg-emerald-600'); }, 1500);
                     } else {
@@ -1977,7 +2324,12 @@ def get_gui():
             }
 
             function deleteSensor(key) {
-                customConfirm(configData.lang === 'ko' ? '이 센서를 삭제하시겠습니까?' : 'Are you sure you want to delete this sensor?', () => {
+                const sName = configData.sensors[key].label || "SENSOR";
+                const msg = configData.lang === 'ko' 
+                    ? `[위험] '${sName}' 센서를 정말 삭제하시겠습니까?\n\n이 센서의 과거 데이터 열(Column)이 로그 파일에서 영구적으로 삭제됩니다. (나머지 센서 기록은 유지됨).\n\n 단순히 숨기고 싶다면 삭제하지 말고 좌측 상단의 [스위치를 OFF]로 끄는 것을 권장합니다.` 
+                    : `[WARNING] Delete '${sName}' sensor?\n\nIts data column will be permanently removed from the log history (other sensors will be kept).\n\n To just hide it, we recommend turning the [Switch OFF] instead of deleting.`;
+                
+                customConfirm(msg, () => {
                     delete configData.sensors[key];
                     triggerSave().then(() => { initDynamicUI(); });
                 });
@@ -2240,12 +2592,15 @@ def get_gui():
                 // Отрисовка сгенерированных карточек
                 displayCards.forEach((card, index) => {
                     let spanClass = "";
-                    
-                    // 정중앙 정렬을 위한 3개, 5개일 때 첫 번째 카드 전체 너비(col-span-2) 설정
                     if ((count === 3 && index === 0) || (count === 5 && index === 0)) {
                         spanClass = "col-span-2"; 
                     }
                     
+                    // Проверяем, включено ли загрязнение, и если нет - добавляем класс hidden
+                    const s_cfg = configData.sensors[card.origKey];
+                    const isContamOn = s_cfg && s_cfg.contam && s_cfg.contam.enabled;
+                    const hideContam = isContamOn ? '' : 'hidden';
+
                     grid.innerHTML += `
                     <div id="card-${card.id}" onclick="focusChart('${card.origKey}')" class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg sensor-card relative overflow-hidden group flex items-center justify-center ${spanClass}">
                         <div class="absolute top-4 left-5 font-black uppercase tracking-wider" style="color: ${card.color}; font-size: ${lblSize};">${card.label}</div>
@@ -2255,9 +2610,9 @@ def get_gui():
                             <span class="text-slate-500 font-bold ml-3" style="font-size: ${unitSize};">${card.unit}</span>
                         </div>
 
-                        <div id="contam-box-${card.id}" class="absolute bottom-3 text-center hidden w-full cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800/50 py-1 transition-colors" onclick="event.stopPropagation(); promptMfgPwd('${card.origKey}')">
-                            <span class="text-xs font-bold text-slate-500">Sensor Contamination: </span> 
-                            <span id="contam-val-${card.id}" class="text-xs font-black text-rose-500">0%</span>
+                        <div id="contam-box-${card.id}" class="absolute bottom-2.5 right-2.5 w-auto text-right px-3 py-2 cursor-pointer bg-slate-100 dark:bg-slate-800/60 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors rounded-lg border border-slate-200 dark:border-slate-700/50 shadow-inner no-select ${hideContam}" onclick="event.stopPropagation(); promptMfgPwd('${card.origKey}')">
+                            <span class="text-xs font-bold text-slate-500 uppercase tracking-widest pl-0.5" data-i18n="contam_label">Contamination: </span> 
+                            <span id="contam-val-${card.id}" class="text-sm font-black text-slate-400 pl-0.5 pr-0.5">OFF</span>
                         </div>
                     </div>`;
                 });
@@ -2315,6 +2670,35 @@ def get_gui():
                         tempOpts += `<option value="${key}" ${configData.sys_temp.sensor === key ? 'selected' : ''}>${s.label}</option>`;
                     }
 
+                    const unitDropdownHTML = `
+                    <div class="ml-3 pl-3 border-l border-slate-300 dark:border-slate-700">
+                        <select id="unit-${key}" onchange="triggerSave()" class="bg-white dark:bg-slate-200 border border-slate-300 dark:border-slate-600 rounded py-1 px-2 text-slate-900 dark:text-black font-bold text-xs shadow-sm focus:outline-none focus:ring-1 focus:ring-cyan-500 cursor-pointer">
+                            ${unitOptions}
+                        </select>
+                    </div>`;
+
+                    const uv254DetailsHTML = `
+                    <div class="mt-3 bg-white dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded p-2 grid grid-cols-2 gap-x-3 gap-y-2 shadow-inner">
+                        <div class="flex justify-between items-center text-[10px] font-bold px-1">
+                            <span class="text-slate-600 dark:text-slate-400">1. TOC</span>
+                            <select id="unit-${key}" onchange="triggerSave()" class="bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded py-0.5 text-slate-900 dark:text-black font-bold text-[10px] shadow-sm focus:outline-none cursor-pointer w-14 text-center">
+                                ${unitOptions}
+                            </select>
+                        </div>
+                        <div class="flex justify-between items-center text-[10px] font-bold px-2 border-l border-slate-200 dark:border-slate-700">
+                            <span class="text-slate-600 dark:text-slate-400 truncate pr-1">3. Turbidity</span>
+                            <span class="text-slate-500 font-black">NTU</span>
+                        </div>
+                        <div class="flex justify-between items-center text-[10px] font-bold px-1">
+                            <span class="text-slate-600 dark:text-slate-400">2. CODcr</span>
+                            <span class="text-slate-400 dark:text-slate-500 text-[9px] pr-1">(=TOC)</span>
+                        </div>
+                        <div class="flex justify-between items-center text-[10px] font-bold px-2 border-l border-slate-200 dark:border-slate-700">
+                            <span class="text-slate-600 dark:text-slate-400">4. Temp</span>
+                            <span class="text-slate-500 font-black">°C</span>
+                        </div>
+                    </div>`;
+
                     engHTML += `
                     <div class="bg-slate-100 dark:bg-slate-800/40 p-4 rounded-lg border border-slate-300 dark:border-slate-700/50 h-auto flex flex-col justify-between">
                         <div class="flex justify-between items-center border-b border-slate-300 dark:border-slate-700/50 pb-3 mb-3">
@@ -2338,23 +2722,24 @@ def get_gui():
                                     <input id="id-${key}" onchange="triggerSave()" type="number" value="${s.id}" class="w-8 text-center bg-transparent text-slate-800 dark:text-white font-black text-xs outline-none no-spin">
                                     <button onclick="stepVal('id-${key}', 1)" class="w-7 py-1 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
                                 </div>
-                                
-                                <div class="ml-3 pl-3 border-l border-slate-300 dark:border-slate-700">
-                                    <select id="unit-${key}" onchange="triggerSave()" class="bg-white dark:bg-slate-200 border border-slate-300 dark:border-slate-600 rounded py-1 px-2 text-slate-900 dark:text-black font-bold text-xs shadow-sm focus:outline-none focus:ring-1 focus:ring-cyan-500 cursor-pointer">
-                                        ${unitOptions}
-                                    </select>
-                                </div>
+                                ${s.type !== 'uv254' ? unitDropdownHTML : ''}
                             </div>
                         </div>
                         
+                        ${s.type === 'uv254' ? uv254DetailsHTML : ''}
+                                                
                         <div class="mt-4 pt-4 border-t border-slate-300 dark:border-slate-700/50 flex gap-2">
-                            <button onclick="openCalModal('${key}', ${s.id}, '${s.type}', '${safeLabel}')" class="flex-1 bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-400 dark:hover:bg-indigo-800/60 py-2 rounded text-[11px] font-black uppercase tracking-wider border border-indigo-200 dark:border-indigo-800 transition-colors shadow-sm flex items-center justify-center gap-1.5">
-                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M10.5 6h9.75M10.5 6a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0M3.75 6H7.5m3 12h9.75m-9.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-3.75 0H7.5m9-6h3.75m-3.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-9.75 0h9.75" /></svg>
-                                <span>${translations[lang].btn_cal}</span>
+                            <button onclick="openCalModal('${key}', ${s.id}, '${s.type}', '${safeLabel}')" class="flex-1 bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-400 dark:hover:bg-indigo-800/60 py-2 rounded text-[11px] font-black uppercase tracking-wider border border-indigo-200 dark:border-indigo-800 transition-colors shadow-sm flex items-center justify-center gap-1">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-3.5 h-3.5"><path stroke-linecap="round" stroke-linejoin="round" d="M10.5 6h9.75M10.5 6a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0M3.75 6H7.5m3 12h9.75m-9.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-3.75 0H7.5m9-6h3.75m-3.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-9.75 0h9.75" /></svg>
+                                <span data-i18n="btn_cal">CAL</span>
                             </button>
-                            <button onclick="openCleanModal('${key}', '${safeLabel}')" class="flex-1 bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/40 dark:text-sky-400 dark:hover:bg-sky-800/60 py-2 rounded text-[11px] font-black uppercase tracking-wider border border-sky-200 dark:border-sky-800 transition-colors shadow-sm flex items-center justify-center gap-1.5">
-                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z" /></svg>
-                                <span>${translations[lang].btn_clean}</span>
+                            <button onclick="openCleanModal('${key}', '${safeLabel}')" class="flex-1 bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/40 dark:text-sky-400 dark:hover:bg-sky-800/60 py-2 rounded text-[11px] font-black uppercase tracking-wider border border-sky-200 dark:border-sky-800 transition-colors shadow-sm flex items-center justify-center gap-1">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-3.5 h-3.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z" /></svg>
+                                <span data-i18n="btn_clean">CLEAN</span>
+                            </button>
+                            <button onclick="promptMfgPwd('${key}')" class="flex-1 bg-emerald-100 text-emerald-700 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-400 dark:hover:bg-emerald-800/60 py-2 rounded text-[11px] font-black uppercase tracking-wider border border-emerald-200 dark:border-emerald-800 transition-colors shadow-sm flex items-center justify-center gap-1">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-3.5 h-3.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+                                <span data-i18n="btn_contam">CONTAM</span>
                             </button>
                         </div>
                     </div>`;
@@ -2536,14 +2921,14 @@ def get_gui():
                             // --- ОБНОВЛЕНИЕ ЗАГРЯЗНЕНИЯ ---
                             const subIds = s.type === 'uv254' ? [key, key+'_cod', key+'_tb', key+'_temp'] : [key];
                             subIds.forEach(id => {
-                                const cBox = document.getElementById('contam-box-' + id);
                                 const cVal = document.getElementById('contam-val-' + id);
-                                if(cBox && cVal) {
+                                if(cVal) {
                                     if(s.contam && s.contam.enabled) {
-                                        cBox.classList.remove('hidden');
                                         cVal.innerText = (d_s.contam_pct || 0) + '%';
+                                        cVal.className = "text-sm font-black text-rose-500 pl-0.5 pr-0.5";
                                     } else {
-                                        cBox.classList.add('hidden');
+                                        cVal.innerText = translations[configData.lang === 'ko' ? 'ko' : 'en'].off;
+                                        cVal.className = "text-sm font-black text-slate-400 pl-0.5 pr-0.5";
                                     }
                                 }
                             });
@@ -2584,7 +2969,6 @@ def get_gui():
                             }
                             if(isErr) { alarmText = 'COMM FAULT'; alarmColor = 'text-rose-600 dark:text-rose-500 font-black'; }
 
-                            // В сайдбаре UV254 остается как один блок (ведь физически это 1 датчик с 1 реле и AO)
                             sidebarHTML += `
                             <div class="card p-3.5 rounded-lg flex flex-col gap-1 border bg-white dark:bg-transparent ${isErr ? 'border-rose-400 bg-rose-50 dark:border-rose-900/50 dark:bg-rose-950/10' : 'border-slate-300 dark:border-slate-800'} shrink-0">
                                 <div class="flex justify-between items-center mb-1 pb-2 border-b border-slate-300 dark:border-slate-700/50">
@@ -2613,16 +2997,51 @@ def get_gui():
                         });
                     }
 
+                    // === ДИНАМИЧЕСКИЙ ПЕРЕСЧЕТ ЛОГОВ (PRESENTATION LAYER) ===
                     if(currentTab === 'logs') {
                         const targetLog = d.logs[currentLogView];
                         const thead = document.getElementById('log-head');
                         const tbody = document.getElementById('log-body');
                         
                         if(targetLog && targetLog.headers.length > 0) {
-                            thead.innerHTML = `<tr class="bg-slate-200 dark:bg-slate-800"><th class="px-6 py-4 font-black tracking-wider uppercase text-slate-700 dark:text-slate-300">${targetLog.headers.join('</th><th class="px-6 py-4 font-black tracking-wider uppercase text-slate-700 dark:text-slate-300">')}</th></tr>`;
                             
-                            tbody.innerHTML = targetLog.rows.map(row => {
-                                while(row.length < targetLog.headers.length) row.push('--');
+                            // 1. Динамически создаем красивые заголовки на основе актуальных настроек
+                            const uiHeaders = targetLog.headers.map(h => {
+                                if (h === 'Time') return 'TIME';
+                                if (h === 'sys_temp') return 'SYS TEMP (°C)';
+                                const s = configData.sensors[h];
+                                if (s) return `${s.label} (${s.unit})`;
+                                return h;
+                            });
+
+                            // 2. Динамически пересчитываем сырые данные из CSV в нужные единицы измерения
+                            const uiRows = targetLog.rows.map(row => {
+                                return row.map((valStr, i) => {
+                                    const h = targetLog.headers[i];
+                                    if (h === 'Time' || h === 'sys_temp') return valStr;
+                                    
+                                    const s = configData.sensors[h];
+                                    if (s && valStr !== '--' && valStr !== 'Err' && valStr !== 'Off' && !isNaN(valStr)) {
+                                        let raw = parseFloat(valStr);
+                                        // Применяем математику "на лету"
+                                        if (s.type === 'oil' && (s.unit === 'mg/L' || s.unit === 'ppm')) raw /= 1000.0;
+                                        else if (s.type === 'mlss' && s.unit === 'g/L') raw /= 1000.0;
+                                        else if (s.type === 'mlss' && s.unit === '%') raw /= 10000.0;
+                                        else if (s.type === 'ec' && s.unit === 'mS/cm') raw /= 1000.0;
+                                        
+                                        return s.type === 'orp' ? raw.toFixed(1) : raw.toFixed(2);
+                                    }
+                                    return valStr;
+                                });
+                            });
+
+                            targetLog.uiHeaders = uiHeaders;
+                            targetLog.uiRows = uiRows;
+
+                            thead.innerHTML = `<tr class="bg-slate-200 dark:bg-slate-800"><th class="px-6 py-4 font-black tracking-wider uppercase text-slate-700 dark:text-slate-300">${uiHeaders.join('</th><th class="px-6 py-4 font-black tracking-wider uppercase text-slate-700 dark:text-slate-300">')}</th></tr>`;
+                            
+                            tbody.innerHTML = uiRows.map(row => {
+                                while(row.length < uiHeaders.length) row.push('--');
                                 
                                 let rowClass = "border-b border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800/80 transition-colors text-sm font-bold";
                                 
@@ -2702,26 +3121,12 @@ def get_gui():
                 }, 3000);
             }
             
-            // ==========================================
-            // ЭТАП 3: ГРАФИКИ ЛОГОВ И ИЗНОС ДАТЧИКОВ
-            // ==========================================
-            
-            // --- 1. ГРАФИК ЛОГОВ ---
-            document.body.insertAdjacentHTML('beforeend', `
-            <div id="log-chart-modal" class="modal-overlay fixed inset-0 bg-slate-900/80 hidden z-50 flex justify-center items-center p-8">
-                <div class="bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-slate-700 rounded-xl w-full h-full p-6 shadow-2xl flex flex-col">
-                    <div class="flex justify-between items-center mb-4 shrink-0">
-                        <h2 class="text-indigo-600 dark:text-indigo-400 font-black text-xl uppercase tracking-wider">DATA GRAPH</h2>
-                        <button onclick="document.getElementById('log-chart-modal').classList.add('hidden')" class="px-6 py-2 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300">CLOSE</button>
-                    </div>
-                    <div class="flex-grow relative min-h-0"><canvas id="logFullCanvas"></canvas></div>
-                </div>
-            </div>`);
-
+            // --- ГРАФИКИ ЛОГОВ ---
             let logFullChartInstance = null;
             async function openLogChart() {
                 const btn = document.getElementById('btn-show-graph');
-                btn.innerText = "LOADING...";
+                const lang = configData.lang === 'ko' ? 'ko' : 'en';
+                btn.innerText = lang === 'ko' ? "로딩중..." : "LOADING...";
                 
                 try {
                     const res = await fetch(`/api/all?log_start=${filterStartDate}&log_end=${filterEndDate}`);
@@ -2729,8 +3134,8 @@ def get_gui():
                     const targetLog = d.logs[currentLogView];
                     
                     if(!targetLog || targetLog.rows.length === 0) {
-                        btn.innerText = "NO DATA";
-                        setTimeout(() => btn.innerText = "SHOW GRAPH", 2000);
+                        btn.innerText = lang === 'ko' ? "데이터 없음" : "NO DATA";
+                        setTimeout(() => btn.innerText = translations[lang].show_graph, 2000);
                         return;
                     }
 
@@ -2738,16 +3143,15 @@ def get_gui():
                     const ctx = document.getElementById('logFullCanvas').getContext('2d');
                     if(logFullChartInstance) logFullChartInstance.destroy();
 
-                    // Парсим таблицу в массивы
-                    const labels = targetLog.rows.map(r => r[0].split(' ')[1] || r[0]); // Берем только время
+                    const labels = targetLog.rows.map(r => r[0].split(' ')[1] || r[0]);
                     const datasets = [];
                     const colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4'];
 
                     for(let i=1; i<targetLog.headers.length; i++) {
-                        if(targetLog.headers[i].includes('SYS TEMP')) continue; // Пропускаем температуру
+                        if(targetLog.headers[i].includes('SYS TEMP')) continue;
                         datasets.push({
-                            label: targetLog.headers[i],
-                            data: targetLog.rows.map(r => parseFloat(r[i]) || null),
+                            label: targetLog.uiHeaders ? targetLog.uiHeaders[i] : targetLog.headers[i], // Подхватываем динамические названия
+                            data: targetLog.uiRows ? targetLog.uiRows.map(r => parseFloat(r[i]) || null) : targetLog.rows.map(r => parseFloat(r[i]) || null),
                             borderColor: colors[i % colors.length],
                             borderWidth: 2, tension: 0.1, pointRadius: 1
                         });
@@ -2758,52 +3162,13 @@ def get_gui():
                         data: { labels: labels, datasets: datasets },
                         options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'top', labels:{color: isDark?'#cbd5e1':'#475569'} } }, scales: { x:{ticks:{color: isDark?'#64748b':'#94a3b8'}}, y:{grid:{color: isDark?'rgba(255,255,255,0.05)':'rgba(0,0,0,0.05)'}, ticks:{color: isDark?'#64748b':'#94a3b8'}} } }
                     });
-                    
                 } catch(e) {}
-                btn.innerText = "SHOW GRAPH";
+                btn.innerText = translations[lang].show_graph;
             }
 
-            // --- 2. ПАРОЛЬ ПРОИЗВОДИТЕЛЯ И ОКНО ИЗНОСА ---
-            document.body.insertAdjacentHTML('beforeend', `
-            <div id="mfg-pwd-modal" class="modal-overlay fixed inset-0 bg-slate-900/60 hidden z-[60] flex justify-center items-center">
-                <div class="bg-white dark:bg-slate-900 border-t-4 border-t-rose-500 rounded-xl w-[350px] p-6 shadow-2xl">
-                    <h2 class="text-rose-600 font-black text-lg mb-4">MANUFACTURER LOGIN</h2>
-                    <input type="password" id="mfg-pwd-input" class="w-full bg-slate-50 dark:bg-slate-800 border rounded p-2 mb-4 dark:text-white" placeholder="Enter Mfg Password">
-                    <div class="flex justify-end gap-2">
-                        <button onclick="document.getElementById('mfg-pwd-modal').classList.add('hidden')" class="px-4 py-2 bg-slate-200 dark:bg-slate-700 rounded font-bold">CANCEL</button>
-                        <button onclick="verifyMfgPwd()" class="px-4 py-2 bg-rose-600 text-white rounded font-bold">ENTER</button>
-                    </div>
-                </div>
-            </div>
-
-            <div id="contam-setup-modal" class="modal-overlay fixed inset-0 bg-slate-900/60 hidden z-[60] flex justify-center items-center">
-                <div class="bg-white dark:bg-slate-900 border-t-4 border-t-emerald-500 rounded-xl w-[400px] p-6 shadow-2xl">
-                    <h2 class="text-emerald-600 font-black text-xl mb-4">CONTAMINATION SETUP</h2>
-                    <input type="hidden" id="contam-s-key">
-                    
-                    <div class="flex justify-between items-center mb-6 bg-slate-100 dark:bg-slate-800 p-3 rounded">
-                        <span class="font-bold dark:text-white text-sm">Enable Contamination Alert</span>
-                        <input type="checkbox" id="contam-enabled" class="w-5 h-5 accent-emerald-500">
-                    </div>
-                    
-                    <div class="mb-6">
-                        <label class="block text-sm font-bold text-slate-500 mb-2">Cycle (Months)</label>
-                        <select id="contam-months" class="w-full bg-slate-50 dark:bg-slate-800 border rounded p-2 font-bold dark:text-white">
-                            ${[1,2,3,4,5,6,7,8,9,10,11,12].map(m=>`<option value="${m}">${m} Months</option>`).join('')}
-                        </select>
-                    </div>
-
-                    <button onclick="resetContamTimer()" class="w-full py-2 mb-6 bg-amber-100 text-amber-700 hover:bg-amber-200 rounded font-black border border-amber-300">RESET TIMER (0%)</button>
-
-                    <div class="flex justify-end gap-2 border-t pt-4">
-                        <button onclick="document.getElementById('contam-setup-modal').classList.add('hidden')" class="px-5 py-2 bg-slate-200 dark:bg-slate-700 rounded font-bold text-slate-700 dark:text-white">CLOSE</button>
-                        <button onclick="saveContamSetup()" class="px-5 py-2 bg-emerald-600 text-white rounded font-bold">SAVE SETUP</button>
-                    </div>
-                </div>
-            </div>`);
-
+            // --- ЗАГРЯЗНЕНИЕ ---
             let currentContamKey = null;
-            const MFG_PWD = "9999"; // Заводской пароль
+            const MFG_PWD = "9999"; 
 
             function promptMfgPwd(key) {
                 currentContamKey = key;
@@ -2827,7 +3192,10 @@ def get_gui():
                 const s = configData.sensors[key];
                 document.getElementById('contam-s-key').value = key;
                 document.getElementById('contam-enabled').checked = s.contam ? s.contam.enabled : false;
+                const monthTxt = configData.lang === 'ko' ? '개월' : 'Months';
+                document.getElementById('contam-months').innerHTML = [1,2,3,4,5,6,7,8,9,10,11,12].map(m=>`<option value="${m}">${m} ${monthTxt}</option>`).join('');
                 document.getElementById('contam-months').value = s.contam ? s.contam.months : 3;
+                
                 document.getElementById('contam-setup-modal').classList.remove('hidden');
             }
 
@@ -2848,7 +3216,6 @@ def get_gui():
                 configData.sensors[key].contam.enabled = document.getElementById('contam-enabled').checked;
                 configData.sensors[key].contam.months = parseInt(document.getElementById('contam-months').value);
                 
-                // Если включили первый раз, ставим таймер
                 if(configData.sensors[key].contam.enabled && !configData.sensors[key].contam.start_ts) {
                     configData.sensors[key].contam.start_ts = Date.now() / 1000;
                 }
@@ -2856,8 +3223,7 @@ def get_gui():
                 await triggerSave();
                 document.getElementById('contam-setup-modal').classList.add('hidden');
                 initDynamicUI();
-            }
-            
+            }            
         </script>
     </body>
     </html>
@@ -2865,10 +3231,27 @@ def get_gui():
 
 def run_api(): uvicorn.run(app, host="127.0.0.1", port=5000, log_level="critical")
 
+class JsApi:
+    def save_file_dialog(self, default_filename):
+        import webview
+        try:
+            result = webview.windows[0].create_file_dialog(
+                webview.FileDialog.SAVE,
+                save_filename=default_filename,
+                file_types=('CSV files (*.csv)', 'All files (*.*)')
+            )
+            if result and len(result) > 0:
+                return result[0]
+        except Exception as e:
+            pass
+        return ""
+
+js_api = JsApi()
+
 if __name__ == "__main__":
     threading.Thread(target=modbus_worker, daemon=True).start()
     threading.Thread(target=cleaning_worker, daemon=True).start()
     threading.Thread(target=run_api, daemon=True).start()
     time.sleep(1)
-    webview.create_window("WATER ANALYZER PRO", "http://127.0.0.1:5000", fullscreen=True)
+    webview.create_window("WATER ANALYZER PRO", "http://127.0.0.1:5000", fullscreen=True, js_api=js_api)
     webview.start()
