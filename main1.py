@@ -26,10 +26,19 @@ os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
 
 def get_active_port():
+    # 1. Сначала ищем стандартные USB-свистки
     ports = glob.glob('/dev/ttyUSB*')
     if ports:
         ports.sort()
         return ports[0]
+        
+    # 2. Если USB нет, проверяем системный UART (для таких HAT-модулей, как на фото)
+    if os.path.exists('/dev/serial0'):
+        return '/dev/serial0'
+    elif os.path.exists('/dev/ttyAMA0'):
+        return '/dev/ttyAMA0'
+        
+    # 3. Резервный вариант
     return '/dev/ttyUSB0'
 
 PORT = get_active_port()
