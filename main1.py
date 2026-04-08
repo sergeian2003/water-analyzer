@@ -883,6 +883,14 @@ def get_gui():
         </script>
         <script src="/static/chart.js"></script>
         <style>
+            html { font-size: 16px; }
+            @media (max-width: 1280px) { html { font-size: 14px; } }
+            @media (max-width: 1024px) { html { font-size: 12px; } }
+            @media (max-width: 800px) { html { font-size: 10px; } }
+            button, .nav-btn, .text-xs, .text-sm, span { 
+                white-space: nowrap; 
+            }
+            
             body { font-family: 'Inter', sans-serif; overflow: hidden; -webkit-font-smoothing: antialiased; transition: background-color 0.3s, color 0.3s; }
             .nav-btn.active { border-bottom: 2px solid #0891b2; color: #0891b2; }
             .dark .nav-btn.active { border-bottom: 2px solid #22d3ee; color: #22d3ee; }
@@ -935,7 +943,7 @@ def get_gui():
     </head>
     <body class="h-screen flex flex-col relative bg-slate-100 dark:bg-[#020617] text-slate-800 dark:text-[#f8fafc]">
 
-        <nav class="flex gap-8 px-8 py-4 bg-white dark:bg-slate-900/50 border-b border-slate-300 dark:border-slate-800 items-center shrink-0 z-10 transition-colors">
+        <nav class="flex gap-3 lg:gap-8 px-3 lg:px-8 py-3 lg:py-4 bg-white dark:bg-slate-900/50 border-b border-slate-300 dark:border-slate-800 items-center shrink-0 z-10 transition-colors overflow-x-auto no-scrollbar">
             <button onclick="showTab('dash')" id="btn-dash" class="nav-btn active text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400" data-i18n="nav_dash">Dashboard</button>
             <button onclick="showTab('trends')" id="btn-trends" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400" data-i18n="nav_trends">Trends</button>
             <button onclick="showTab('logs')" id="btn-logs" class="nav-btn text-sm font-black uppercase tracking-wider text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400" data-i18n="nav_logs">Logs</button>
@@ -968,7 +976,7 @@ def get_gui():
                 </div>
             </div>
             
-            <div class="w-[280px] 2xl:w-[320px] flex flex-col gap-3 shrink-0 min-h-0">
+            <div class="w-64 xl:w-72 flex flex-col gap-3 shrink-0 min-h-0">
                 <h2 class="text-xs font-black text-slate-500 uppercase tracking-widest shrink-0 px-2" data-i18n="sys_status">System Status</h2>
                 <div id="status-sidebar" class="overflow-y-auto space-y-3 pr-2 pb-4 flex-grow min-h-0"></div>
             </div>
@@ -1069,8 +1077,8 @@ def get_gui():
             </div>
         </main>
 
-        <main id="tab-eng" class="p-6 hidden flex-grow flex gap-6 overflow-hidden min-h-0">
-            <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-6 flex flex-col gap-4 w-2/3 min-h-0">
+        <main id="tab-eng" class="p-4 lg:p-6 hidden flex-grow flex flex-col lg:flex-row gap-4 lg:gap-6 overflow-y-auto lg:overflow-hidden min-h-0">
+            <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-6 flex flex-col gap-4 w-full lg:w-2/3 min-h-[50vh] lg:min-h-0 min-h-0">
                 <div class="flex justify-between items-end border-b border-slate-300 dark:border-slate-700 pb-3 shrink-0">
                     <div class="flex items-center gap-4">
                         <h2 class="text-cyan-600 dark:text-cyan-400 font-black text-base uppercase flex items-center gap-3">
@@ -1096,7 +1104,7 @@ def get_gui():
                 <div id="eng-sensors" class="grid grid-cols-2 gap-4 mt-2 overflow-y-auto pr-2 flex-grow min-h-0 content-start"></div>
             </div>
             
-            <div class="flex flex-col gap-6 w-1/3 min-h-0 overflow-y-auto pr-1">
+            <div class="flex flex-col gap-4 lg:gap-6 w-full lg:w-1/3 min-h-0 shrink-0 overflow-y-auto pr-1">
                 <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-6 flex flex-col gap-4 shrink-0">
                     <div class="border-b border-slate-300 dark:border-slate-700 pb-3 flex justify-between items-end shrink-0">
                         <h2 class="text-emerald-600 dark:text-emerald-500 font-black text-base uppercase" data-i18n="ao_scaling">4-20mA Scaling</h2>
