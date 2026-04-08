@@ -32,13 +32,19 @@ def get_active_port():
         ports.sort()
         return ports[0]
         
-    # 2. Если USB нет, проверяем системный UART (для таких HAT-модулей, как на фото)
+    # 2. Ищем порты от SPI-to-UART модулей (Waveshare HAT)
+    if os.path.exists('/dev/ttySC0'):
+        return '/dev/ttySC0'
+    elif os.path.exists('/dev/ttySC1'):
+        return '/dev/ttySC1'
+        
+    # 3. Проверяем стандартный системный UART 
     if os.path.exists('/dev/serial0'):
         return '/dev/serial0'
     elif os.path.exists('/dev/ttyAMA0'):
         return '/dev/ttyAMA0'
         
-    # 3. Резервный вариант
+    # 4. Резервный вариант
     return '/dev/ttyUSB0'
 
 PORT = get_active_port()
@@ -185,7 +191,7 @@ def create_instrument(sensor_id):
         _shared_instr.serial.baudrate = 9600
         _shared_instr.serial.bytesize = 8
         _shared_instr.serial.parity = minimalmodbus.serial.PARITY_NONE
-        _shared_instr.serial.stopbits = 2  
+        _shared_instr.serial.stopbits = 1 
         _shared_instr.serial.timeout = 0.7  
         _shared_instr.clear_buffers_before_each_transaction = True
     else:
@@ -2850,7 +2856,7 @@ def get_gui():
                             </div>
                             <div class="flex-1 flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden bg-white dark:bg-slate-800">
                                 <span class="px-2 py-1.5 text-[10px] font-black text-slate-500 border-r border-slate-300 dark:border-slate-600">20mA (°C)</span>
-                                <input type="number" id="sys-t-max" onchange="change" triggerSave()" value="${configData.sys_temp.max}" class="w-full text-center bg-transparent text-xs font-bold outline-none dark:text-white">
+                                <input type="number" id="sys-t-max" onchange="triggerSave()" value="${configData.sys_temp.max}" class="w-full text-center bg-transparent text-xs font-bold outline-none dark:text-white">
                             </div>
                         </div>
                     </div>
