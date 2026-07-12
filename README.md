@@ -20,7 +20,7 @@ IoT kiosk application built for Raspberry Pi to monitor water quality and contro
 
 1. Clone the repository:
    \`\`\`bash
-   git clone https://github.com/sergeian2003/smart-farm-analyzer.git
+   git clone https://github.com/sergeian2003/water-analyzer.git
    cd smart-farm-analyzer
    \`\`\`
 
