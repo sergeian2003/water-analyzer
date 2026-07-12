@@ -17,8 +17,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
-# === 시스템 절대 경로 고정 ===
-BASE_DIR = '/home/young/farm'
+# === System absolute path setup ===
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) 
 LOG_DIR = os.path.join(BASE_DIR, 'logs')
 STATIC_DIR = os.path.join(BASE_DIR, 'static')
 
@@ -26,25 +26,25 @@ os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
 
 def get_active_port():
-    # 1. Сначала ищем стандартные USB-свистки
+    # 1. First, search for standard USB dongles
     ports = glob.glob('/dev/ttyUSB*')
     if ports:
         ports.sort()
         return ports[0]
         
-    # 2. Ищем порты от SPI-to-UART модулей (Waveshare HAT)
+    # 2. Search for SPI-to-UART module ports (e.g., Waveshare HAT)
     if os.path.exists('/dev/ttySC0'):
         return '/dev/ttySC0'
     elif os.path.exists('/dev/ttySC1'):
         return '/dev/ttySC1'
         
-    # 3. Проверяем стандартный системный UART 
+    # 3. Check standard system UART 
     if os.path.exists('/dev/serial0'):
         return '/dev/serial0'
     elif os.path.exists('/dev/ttyAMA0'):
         return '/dev/ttyAMA0'
         
-    # 4. Резервный вариант
+    # 4. Fallback option
     return '/dev/ttyUSB0'
 
 PORT = get_active_port()
@@ -64,11 +64,11 @@ BASE_UNITS = {
     "oil": "ug/L", "ph": "pH", "ec": "uS/cm", "turbidity": "NTU"
 }
 
-# --- 동적(Dynamic) 설정 ---
+# --- Dynamic Settings ---
 DEFAULT_CONFIG = {
     "theme": "dark",
     "lang": "en",
-    "admin_pwd": "1234",
+    "admin_pwd": "<YOUR_ADMIN_PASSWORD>",
     "relay_id": 8,
     "ao_id": 9,
     "relay_name": "KM6063 Relay Module",
@@ -93,7 +93,7 @@ def load_config():
                 cfg = json.load(f)
                 if "theme" not in cfg: cfg["theme"] = "dark"
                 if "lang" not in cfg: cfg["lang"] = "en"
-                if "admin_pwd" not in cfg: cfg["admin_pwd"] = "1234"
+                if "admin_pwd" not in cfg: cfg["admin_pwd"] = "<YOUR_ADMIN_PASSWORD>"
                 if "ao_id" not in cfg: cfg["ao_id"] = 9
                 if "relay_id" not in cfg: cfg["relay_id"] = 8
                 if "relay_name" not in cfg: cfg["relay_name"] = "KM6063 Relay Module"
@@ -371,7 +371,7 @@ def modbus_worker():
                             elif s_type == "mlss" and s_unit == "%": val_num = base_val / 10000.0
                             elif s_type == "ec" and s_unit == "mS/cm": val_num = base_val / 1000.0
                         
-                        # --- ЛОГИКА ЗАГРЯЗНЕНИЯ (ИЗНОСА) ---
+                        # --- CONTAMINATION (WEAR) LOGIC ---
                         contam_cfg = s.get("contam", {})
                         contam_pct = 0
                         is_contam_err = False
@@ -398,14 +398,14 @@ def modbus_worker():
                             sensor_data[key]["val"] = fmt.format(val_num)
                             if s_type == "uv254": sensor_data[key]["cod"] = fmt.format(val_num)
                             
-                            # CSV 정합성: 항상 RAW Base Value 저장
+                            # CSV Consistency: Always save RAW Base Value
                             sensor_data[key]["log_val"] = fmt.format(base_val)
                         
                         min_v = float(s.get("min", 0))
                         max_v = float(s.get("max", 100))
                         
                         if val_num is not None:
-                            # 1시간 평균도 RAW 데이터 기준으로 쌓음
+                            # 1-hour average is also accumulated based on RAW data
                             if key not in hourly_buffer: hourly_buffer[key] = []
                             hourly_buffer[key].append(base_val)
                             
@@ -574,7 +574,7 @@ async def update_cfg(request: Request):
     if set(old_keys) != set(new_keys):
         init_data_structures()
         
-        # --- SMART CSV REBUILD (Защита истории) ---
+        # --- SMART CSV REBUILD (History Protection) ---
         def rebuild_csv(filepath, target_keys):
             if not os.path.exists(filepath): return
             try:
@@ -585,15 +585,15 @@ async def update_cfg(request: Request):
                 old_headers = rows[0]
                 new_headers = ["Time"] + target_keys + ["sys_temp"]
                 
-                # Ищем индексы старых колонок
+                # Find indices of old columns
                 idx_map = []
                 for nh in new_headers:
                     if nh in old_headers:
                         idx_map.append(old_headers.index(nh))
                     else:
-                        idx_map.append(-1) # Для новых датчиков
+                        idx_map.append(-1) # For new sensors
                         
-                # Переписываем файл с новыми колонками
+                # Rewrite file with new columns
                 with open(filepath, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
                     writer.writerow(new_headers)
@@ -677,7 +677,7 @@ def get_export_options(type: str):
 async def export_execute(request: Request):
     payload = await request.json()
     log_type = payload.get("type", "5min")
-    sel_cols = payload.get("columns", []) # 이제 key값 배열이 들어옴 ("Time", "s_1" 등)
+    sel_cols = payload.get("columns", []) # Now receives an array of keys (e.g., "Time", "s_1")
     sel_dates = payload.get("dates", [])
     destination = payload.get("path", "") 
     
@@ -701,7 +701,7 @@ async def export_execute(request: Request):
             if not col_indices:
                 return {"status": "error", "message": "No columns selected"}
             
-            # 1. 파일용 헤더(Label + Unit) 생성
+            # 1. Generate headers for the file (Label + Unit)
             out_headers = []
             for i in col_indices:
                 h = headers[i]
@@ -714,7 +714,7 @@ async def export_execute(request: Request):
                 
             writer.writerow(out_headers)
             
-            # 2. 데이터 변환 및 쓰기
+            # 2. Data conversion and writing
             for row in reader:
                 if not row: continue
                 date_part = row[0].split(' ')[0]
@@ -1459,7 +1459,6 @@ def get_gui():
             </div>
         </div>
         
-        <!-- ДОБАВЛЕНО: ОКНА ГРАФИКА И ЗАГРЯЗНЕНИЯ -->
         <div id="log-chart-modal" class="modal-overlay fixed inset-0 bg-slate-900/80 hidden z-50 flex justify-center items-center p-8">
             <div class="bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-slate-700 rounded-xl w-full h-full p-6 shadow-2xl flex flex-col">
                 <div class="flex justify-between items-center mb-4 shrink-0">
@@ -1503,16 +1502,16 @@ def get_gui():
         </div>
 
         <script>
-            // =========================================================
-            // 🔥 ADVANCED SMART ON-SCREEN KEYBOARD (OSK) with Preview
-            // =========================================================
+            // =====================================================
+            // ADVANCED SMART ON-SCREEN KEYBOARD (OSK) with Preview
+            // =====================================================
             const KioskBoard = {
                 activeInput: null,
                 mode: 'num', 
                 isShift: false,
 
                 init() {
-                    // --- CSS стили для клавиатуры и предпросмотра ---
+                    // --- CSS styles for keyboard and preview ---
                     const stylesHTML = `
                     <style>
                         #osk-wrapper .osk-btn {
@@ -1521,30 +1520,30 @@ def get_gui():
                             cursor: pointer; user-select: none; font-size: 1.25rem;
                         }
                         
-                        /* Светлая тема (По умолчанию) */
+                        /* Light theme (Default) */
                         .osk-btn { background-color: #ffffff; color: #1e293b; border-color: #cbd5e1; }
                         .osk-btn:hover { background-color: #f1f5f9; }
                         .osk-btn:active { background-color: #06b6d4; color: #ffffff; }
                         
-                        /* Темная тема (через класс .dark) */
+                        /* Dark theme (via .dark class) */
                         .dark .osk-btn { background-color: #334155; color: #ffffff; border-color: #475569; }
                         .dark .osk-btn:hover { background-color: #475569; }
                         .dark .osk-btn:active { background-color: #0891b2; color: #ffffff; }
 
-                        /* ENTER Кнопка */
+                        /* ENTER Button */
                         #osk-wrapper .osk-btn-enter { background-color: #0891b2; color: #ffffff; border-color: #0e7490; font-weight: 900; font-size: 0.8rem; letter-spacing: 0.1em; }
                         #osk-wrapper .osk-btn-enter:hover { background-color: #06b6d4; }
                         #osk-wrapper .osk-btn-enter:active { background-color: #22d3ee; }
 
-                        /* Shift Кнопка (активная) */
+                        /* Shift Button (active) */
                         #osk-wrapper .osk-btn-shift-active { background-color: #cffafe; color: #0891b2; border-color: #22d3ee; }
                         .dark #osk-wrapper .osk-btn-shift-active { background-color: #0c4a6e; color: #67e8f9; border-color: #0e7490; }
 
-                        /* Danger Кнопки (Back, CLR) */
+                        /* Danger Buttons (Back, CLR) */
                         #osk-wrapper .osk-btn-danger { background-color: #fee2e2; color: #dc2626; border-color: #fecaca; }
                         .dark #osk-wrapper .osk-btn-danger { background-color: #4c1d1d; color: #f87171; border-color: #7f1d1d; }
 
-                        /* --- Поле предпросмотра (Preview) --- */
+                        /* --- Preview Field --- */
                         #osk-preview {
                             font-family: 'Montserrat', sans-serif; font-weight: 700; font-size: 1.5rem;
                             padding: 0.5rem 1.25rem; border-radius: 0.375rem; border-width: 1px;
@@ -1553,7 +1552,7 @@ def get_gui():
                         }
                         .dark #osk-preview { background-color: #030712; color: #06b6d4; border-color: #334155; text-shadow: 0 0 10px rgba(6,182,212,0.3); }
 
-                        /* CLOSE Кнопка (на панели) */
+                        /* CLOSE Button (on the panel) */
                         #osk-wrapper .osk-btn-close {
                             text-transform: uppercase; font-weight: 900; font-size: 0.8rem; padding: 0.6rem 1.5rem;
                             background-color: #fee2e2; color: #dc2626; border-color: #fecaca; border-radius: 0.375rem; border-width: 1px; cursor: pointer;
@@ -1575,10 +1574,10 @@ def get_gui():
                     </div>`;
                     document.body.insertAdjacentHTML('beforeend', html);
 
-                    // Глобальный перехватчик фокуса
+                    // Global focus interceptor
                     document.addEventListener('focusin', (e) => {
                         if(e.target.tagName === 'INPUT' && !['checkbox', 'radio', 'color', 'date'].includes(e.target.type)) {
-                            // Игнорируем фокус на самом поле предпросмотра
+                            // Ignore focus on the preview field itself
                             if(e.target.id === 'osk-preview') return;
 
                             if(e.target.type === 'number' || e.target.id.includes('pwd') || e.target.classList.contains('no-spin')) {
@@ -1595,11 +1594,11 @@ def get_gui():
                     this.mode = mode;
                     this.isShift = false;
                     
-                    // --- 1. Обновить поле предпросмотра при открытии ---
+                    // --- 1. Update preview field on open ---
                     const preview = document.getElementById('osk-preview');
                     if(preview) {
                         preview.value = input.value;
-                        preview.type = input.type; // Зеркалим тип (password -> ***)
+                        preview.type = input.type; // Mirror type (password -> ***)
                         // Placeholder
                         preview.placeholder = mode === 'num' ? 'Enter numbers...' : 'Enter text...';
                     }
@@ -1619,7 +1618,7 @@ def get_gui():
                         this.activeInput = null;
                     }
                     
-                    // --- 2. Очистить поле предпросмотра при закрытии ---
+                    // --- 2. Clear preview field on close ---
                     const preview = document.getElementById('osk-preview');
                     if(preview) preview.value = '';
                     // ------------------------------------------------
@@ -1635,7 +1634,7 @@ def get_gui():
                     container.innerHTML = '';
                     document.getElementById('osk-title').innerText = this.mode === 'num' ? 'NUM PAD' : 'ENGLISH OSK';
                     
-                    // (Логика layoutData осталась старой, пропущу для краткости)
+                    // (layoutData logic remains the same, skipped for brevity)
                     const rowsFull = [['1','2','3','4','5','6','7','8','9','0','-','+','Back:1.5'],['q','w','e','r','t','y','u','i','o','p','[',']'],['a','s','d','f','g','h','j','k','l',':',';','Enter:1.5'],['Shift:1.5','z','x','c','v','b','n','m',',','.','/','Shift:1.5'],['Space:5']];
                     const rowsShift = [['!','@','#','$','%','^','&','*','(',')','_','=','Back:1.5'],['Q','W','E','R','T','Y','U','I','O','P','{','}'],['A','S','D','F','G','H','J','K','L','"',"'",'Enter:1.5'],['Shift:1.5','Z','X','C','V','B','N','M','<','>','?','Shift:1.5'],['Space:5']];
                     const rowsNum = [['7','8','9','Back:1.5'],['4','5','6','CLR:1.5'],['1','2','3','Enter:1.5'],['0','-','.','Space:1.5']];
@@ -1649,7 +1648,7 @@ def get_gui():
                             let [key, flex] = keyDef.split(':');
                             flex = flex || '1';
                             const btn = document.createElement('button');
-                            btn.className = 'osk-btn'; // Используем новый CSS класс
+                            btn.className = 'osk-btn'; // Use new CSS class
                             btn.style.flex = flex;
                             
                             if (key === 'Space') { btn.innerHTML = '&#9251;'; } 
@@ -1680,7 +1679,7 @@ def get_gui():
                     
                     this.activeInput.value = val;
                     
-                    // --- 3. НЕВЕРОЯТНО ВАЖНО: Зеркалим ввод в предпросмотр ---
+                    // --- 3. CRITICALLY IMPORTANT: Mirror input to preview ---
                     const preview = document.getElementById('osk-preview');
                     if(preview) preview.value = val;
                     // -------------------------------------------------------
@@ -2005,7 +2004,6 @@ def get_gui():
                 fetch(`/api/ao_manual?ch=${ch}&active=${isActive ? 1 : 0}&val=${val}`);
             }
             
-            // --- СИНХРОНИЗАЦИЯ НОВОГО UI ---
             function syncAoUI(ch) {
                 const slider = document.getElementById('ao-slider-' + ch);
                 const valTxt = document.getElementById('ao-val-' + ch);
@@ -2049,7 +2047,7 @@ def get_gui():
             function verifyAdmin() {
                 const pwdInput = document.getElementById('admin-pwd-input');
                 const pwd = pwdInput.value;
-                const correctPwd = configData.admin_pwd || "1234";
+                const correctPwd = configData.admin_pwd || "<YOUR_ADMIN_PASSWORD>";
                 
                 if(pwd === correctPwd) {
                     isAdmin = true;
@@ -2066,10 +2064,10 @@ def get_gui():
                     pwdInput.value = ""; 
                     
                     if(pwdFails >= 5) {
-                        configData.admin_pwd = "1234";
+                        configData.admin_pwd = "<YOUR_ADMIN_PASSWORD>";
                         triggerSave();
                         const errEl = document.getElementById('admin-error');
-                        errEl.innerText = configData.lang === 'ko' ? "비밀번호가 1234로 초기화되었습니다!" : "Password reset to default (1234)!";
+                        errEl.innerText = configData.lang === 'ko' ? "비밀번호가 초기화되었습니다!" : "Password reset to default!";
                         errEl.classList.remove('hidden');
                         pwdFails = 0;
                     } else {
@@ -2575,17 +2573,17 @@ def get_gui():
                 
                 const activeSensors = Object.entries(configData.sensors || {}).filter(([k, v]) => v.enabled);
                 
-                // === МАГИЯ РАСЩЕПЛЕНИЯ UV254 ===
+                // === UV254 SPLITTING ===
                 let displayCards = [];
                 activeSensors.forEach(([key, s]) => {
                     if (s.type === 'uv254') {
-                        // Создаем 4 виртуальные карточки
+                        // 4 virtual cards
                         displayCards.push({ id: key, origKey: key, label: 'TOC', unit: s.unit || 'mg/L', color: s.color });
                         displayCards.push({ id: key + '_cod', origKey: key, label: 'CODcr', unit: s.unit || 'mg/L', color: s.color });
                         displayCards.push({ id: key + '_tb', origKey: key, label: 'TURBIDITY', unit: 'NTU', color: s.color });
                         displayCards.push({ id: key + '_temp', origKey: key, label: 'TEMP', unit: '°C', color: s.color });
                     } else {
-                        // Обычный датчик
+                        // Standard sensor
                         displayCards.push({ id: key, origKey: key, label: s.label, unit: s.unit, color: s.color });
                     }
                 });
@@ -2630,14 +2628,14 @@ def get_gui():
                 else if (count <= 6) { valSize = '10vh'; unitSize = '3vh'; lblSize = '2vh'; }
                 else { valSize = '6vh'; unitSize = '2vh'; lblSize = '1.5vh'; }
 
-                // Отрисовка сгенерированных карточек
+                // Render generated cards
                 displayCards.forEach((card, index) => {
                     let spanClass = "";
                     if ((count === 3 && index === 0) || (count === 5 && index === 0)) {
                         spanClass = "col-span-2"; 
                     }
                     
-                    // Проверяем, включено ли загрязнение, и если нет - добавляем класс hidden
+                    // Check if contamination is enabled, add 'hidden' class if not
                     const s_cfg = configData.sensors[card.origKey];
                     const isContamOn = s_cfg && s_cfg.contam && s_cfg.contam.enabled;
                     const hideContam = isContamOn ? '' : 'hidden';
@@ -2811,7 +2809,7 @@ def get_gui():
                     }
                 }
                 
-                // === НОВАЯ КАРТОЧКА AO MAPPING ===
+                // === NEW AO MAPPING CARD ===
                 let aoMapHTML = `
                 <div class="bg-orange-50 dark:bg-orange-900/20 p-4 rounded-lg border border-orange-200 dark:border-orange-800 mb-4 shrink-0">
                     <h3 class="text-sm font-black text-orange-700 dark:text-orange-400 uppercase tracking-widest mb-3" data-i18n="ao_mapping">AO Port Mapping</h3>
@@ -2836,7 +2834,7 @@ def get_gui():
                 }
                 aoMapHTML += `</div></div>`;
 
-                // === ОБНОВЛЕННАЯ ТЕМПЕРАТУРА (БЕЗ ВЫБОРА CH) ===
+                // === TEMPERATURE ===
                 let sysTempHTML = `
                 <div class="bg-blue-50 dark:bg-blue-900/20 p-4 rounded-lg border border-blue-200 dark:border-blue-800 mb-4 shrink-0">
                     <h3 class="text-sm font-black text-blue-700 dark:text-blue-400 uppercase tracking-widest mb-3 flex items-center gap-2">
@@ -2981,7 +2979,7 @@ def get_gui():
                             const statColor = isErr ? 'text-rose-500' : 'text-emerald-600 dark:text-emerald-400';
                             const dotColor = isErr ? 'bg-rose-500' : 'bg-emerald-500 animate-pulse';
                             
-                            // --- ОБНОВЛЕНИЕ ЗАГРЯЗНЕНИЯ ---
+                            // --- CONTAMINATION ---
                             const subIds = s.type === 'uv254' ? [key, key+'_cod', key+'_tb', key+'_temp'] : [key];
                             subIds.forEach(id => {
                                 const cVal = document.getElementById('contam-val-' + id);
@@ -2996,7 +2994,7 @@ def get_gui():
                                 }
                             });
                             
-                            // === ОБНОВЛЕНИЕ РАСЩЕПЛЕННОГО UV254 ===
+                            // === UV254 ===
                             if (s.type === 'uv254') {
                                 const els = [
                                     { id: 'v-' + key, val: d_s.val },
@@ -3014,7 +3012,7 @@ def get_gui():
                                     }
                                 });
                             } else {
-                                // Обычный датчик
+                                // Standard sensor
                                 const el = document.getElementById('v-' + key);
                                 if(el) {
                                     el.innerText = d_s.val;
@@ -3060,7 +3058,7 @@ def get_gui():
                         });
                     }
 
-                    // === ДИНАМИЧЕСКИЙ ПЕРЕСЧЕТ ЛОГОВ (PRESENTATION LAYER) ===
+                    // === DYNAMIC LOG RECALCULATION (PRESENTATION LAYER) ===
                     if(currentTab === 'logs') {
                         const targetLog = d.logs[currentLogView];
                         const thead = document.getElementById('log-head');
@@ -3068,7 +3066,7 @@ def get_gui():
                         
                         if(targetLog && targetLog.headers.length > 0) {
                             
-                            // 1. Динамически создаем красивые заголовки на основе актуальных настроек
+                            // 1. Dynamically create clean headers based on current settings
                             const uiHeaders = targetLog.headers.map(h => {
                                 if (h === 'Time') return 'TIME';
                                 if (h === 'sys_temp') return 'SYS TEMP (°C)';
@@ -3077,7 +3075,7 @@ def get_gui():
                                 return h;
                             });
 
-                            // 2. Динамически пересчитываем сырые данные из CSV в нужные единицы измерения
+                            // 2. Dynamically recalculate raw CSV data into required units
                             const uiRows = targetLog.rows.map(row => {
                                 return row.map((valStr, i) => {
                                     const h = targetLog.headers[i];
@@ -3086,7 +3084,7 @@ def get_gui():
                                     const s = configData.sensors[h];
                                     if (s && valStr !== '--' && valStr !== 'Err' && valStr !== 'Off' && !isNaN(valStr)) {
                                         let raw = parseFloat(valStr);
-                                        // Применяем математику "на лету"
+                                        // Apply math
                                         if (s.type === 'oil' && (s.unit === 'mg/L' || s.unit === 'ppm')) raw /= 1000.0;
                                         else if (s.type === 'mlss' && s.unit === 'g/L') raw /= 1000.0;
                                         else if (s.type === 'mlss' && s.unit === '%') raw /= 10000.0;
@@ -3184,7 +3182,7 @@ def get_gui():
                 }, 3000);
             }
             
-            // --- ГРАФИКИ ЛОГОВ ---
+            // --- LOG CHARTS ---
             let logFullChartInstance = null;
             async function openLogChart() {
                 const btn = document.getElementById('btn-show-graph');
@@ -3202,7 +3200,7 @@ def get_gui():
                         return;
                     }
 
-                    // --- УМНОЕ ФОРМАТИРОВАНИЕ ДАННЫХ ДЛЯ ГРАФИКА ---
+                    // --- SMART DATA FORMATTING FOR CHARTS ---
                     const uiHeaders = targetLog.headers.map(h => {
                         if (h === 'Time') return 'TIME';
                         if (h === 'sys_temp') return 'SYS TEMP (°C)';
@@ -3241,8 +3239,8 @@ def get_gui():
                     for(let i=1; i<targetLog.headers.length; i++) {
                         if(targetLog.headers[i].includes('SYS TEMP')) continue;
                         datasets.push({
-                            label: uiHeaders[i], // Используем красивые названия
-                            data: uiRows.map(r => parseFloat(r[i]) || null), // Используем пересчитанные значения
+                            label: uiHeaders[i], // Use clean names
+                            data: uiRows.map(r => parseFloat(r[i]) || null), // Use recalculated values
                             borderColor: colors[i % colors.length],
                             borderWidth: 2, tension: 0.1, pointRadius: 1
                         });
@@ -3257,9 +3255,9 @@ def get_gui():
                 btn.innerText = translations[lang].show_graph;
             }
 
-            // --- ЗАГРЯЗНЕНИЕ ---
+            // --- Pollution ---
             let currentContamKey = null;
-            const MFG_PWD = "9999"; 
+            const MFG_PWD = "YOUR_MFG_PASSWORD"; 
 
             function promptMfgPwd(key) {
                 currentContamKey = key;
