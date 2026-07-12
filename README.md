@@ -1,6 +1,6 @@
 # Smart Water Analyzer
 
-An industrial IoT kiosk application built for Raspberry Pi to monitor water quality and control farm environments. The system communicates with multiple Modbus RTU (RS485) sensors, logs data, and provides a touchscreen-friendly Kiosk UI.
+IoT kiosk application built for Raspberry Pi to monitor water quality and control farm environments. The system communicates with multiple Modbus RTU (RS485) sensors, logs data, and provides a touchscreen-friendly Kiosk UI.
 
 ## Features
 
