@@ -48,6 +48,7 @@ def get_active_port():
     return '/dev/ttyUSB0'
 
 PORT = get_active_port()
+#PORT = 'COM6' #for Windows testing
 
 LOG_5MIN = os.path.join(LOG_DIR, 'data_5min.csv')
 LOG_1HR = os.path.join(LOG_DIR, 'data_1hr.csv')
@@ -68,7 +69,7 @@ BASE_UNITS = {
 DEFAULT_CONFIG = {
     "theme": "dark",
     "lang": "en",
-    "admin_pwd": "<YOUR_ADMIN_PASSWORD>",
+    "admin_pwd": "1234",
     "relay_id": 8,
     "ao_id": 9,
     "relay_name": "KM6063 Relay Module",
@@ -93,11 +94,12 @@ def load_config():
                 cfg = json.load(f)
                 if "theme" not in cfg: cfg["theme"] = "dark"
                 if "lang" not in cfg: cfg["lang"] = "en"
-                if "admin_pwd" not in cfg: cfg["admin_pwd"] = "<YOUR_ADMIN_PASSWORD>"
+                if "admin_pwd" not in cfg: cfg["admin_pwd"] = "1234"
                 if "ao_id" not in cfg: cfg["ao_id"] = 9
                 if "relay_id" not in cfg: cfg["relay_id"] = 8
                 if "relay_name" not in cfg: cfg["relay_name"] = "KM6063 Relay Module"
                 if "ao_name" not in cfg: cfg["ao_name"] = "KM6023 Analog Output"
+                if "ao_offset" not in cfg: cfg["ao_offset"] = 0.0
                 if "sys_temp" not in cfg: cfg["sys_temp"] = {"sensor": "", "ch": 4, "min": 0, "max": 50}
                 if "ao_map" not in cfg: cfg["ao_map"] = {str(i): "off" for i in range(8)}
                 if "export_path" not in cfg: cfg["export_path"] = ""
@@ -144,7 +146,10 @@ config = load_config()
 sensor_data = {"sys_temp": "--", "sys_temp_ao": "0.00"}
 history_data = {}
 relay_states = {} 
+di_states = {i: 0 for i in range(8)}
+ai_states = {i: 0.0 for i in range(8)}
 ao_manual = {i: {"active": False, "val": 4.0} for i in range(8)}
+auto_ao_out = {i: 4.0 for i in range(8)}
 
 hourly_buffer = {}
 alarm_states = {}
@@ -198,9 +203,9 @@ def create_instrument(sensor_id):
         _shared_instr.address = int(sensor_id)
     return _shared_instr
 
-def read_with_retry(func, *args, retries=2):
+def read_with_retry(func, *args, retries=2, **kwargs):
     for attempt in range(retries):
-        try: return func(*args)
+        try: return func(*args, **kwargs)
         except:
             time.sleep(0.2) 
             if attempt == retries - 1: raise
@@ -302,9 +307,58 @@ def cleaning_worker():
                 del clean_relay_off[act_key]
                 
         time.sleep(1)
+        
+def io_worker():
+    global di_states
+    while True:
+        time.sleep(0.1)
+        
+        # === 1. FAST READ DI ===
+        try:
+            r_id = get_safe_int(config.get("relay_id", 8), 8)
+            with modbus_lock:
+                instr_di = create_instrument(r_id)
+                try:
+                    di_list = read_with_retry(instr_di.read_bits, 0, 8, functioncode=2, retries=1)
+                    for ch in range(8):
+                        di_states[ch] = di_list[ch]
+                except:
+                    pass
+                time.sleep(0.05)
+        except Exception: pass
+
+        # === 2. FAST REGISTER AO ===
+        try:
+            ao_id = get_safe_int(config.get("ao_id", 9), 9)
+            with modbus_lock:
+                instr_ao = create_instrument(ao_id)
+                for c in range(4):
+                    is_manual = ao_manual.get(c, {}).get("active")
+                    target_ao = ao_manual[c]["val"] if is_manual else auto_ao_out.get(c, 4.0)
+                    out_val = int(target_ao * 2500)
+                    out_val = max(0, min(50000, out_val)) 
+                    try:
+                        read_with_retry(instr_ao.write_register, c, out_val, 0, 6, retries=1)
+                    except Exception: pass
+                time.sleep(0.05)
+        except Exception: pass
+        
+        # === 3. FAST READ AI ===
+        try:
+            ao_id = get_safe_int(config.get("ao_id", 9), 9)
+            with modbus_lock:
+                instr_ai = create_instrument(ao_id)
+                for ch in range(8):
+                    try:
+                        raw_val = read_with_retry(instr_ai.read_register, ch, 0, 4, retries=1)
+                        ai_states[ch] = raw_val / 2500.0
+                    except Exception:
+                        ai_states[ch] = "Err"
+                time.sleep(0.05)
+        except Exception: pass
 
 def modbus_worker():
-    global sensor_data, history_data, hourly_buffer, alarm_states
+    global sensor_data, history_data, hourly_buffer, alarm_states, auto_ao_out
     last_5min_minute = -1
     last_1hr_hour = -1
     
@@ -312,7 +366,6 @@ def modbus_worker():
         now = datetime.now()
         all_keys = list(config.get("sensors", {}).keys())
         active_keys = [k for k in all_keys if config["sensors"][k].get("enabled")]
-        auto_ao_out = {0: 4.0, 1: 4.0, 2: 4.0, 3: 4.0}
         
         try:
             sensors_cfg = list(config.get("sensors", {}).items())
@@ -424,6 +477,8 @@ def modbus_worker():
                         
                         sensor_data[key]["ao"] = f"{ao_val:.2f}"
                         sensor_data[key]["status"] = "OK"
+                        
+                        time.sleep(0.05)
                             
                     if len(history_data[key]) > 0: history_data[key].pop(0)
                     history_data[key].append(val_num)
@@ -478,25 +533,6 @@ def modbus_worker():
                         auto_ao_out[c] = 4.0
                 else:
                     auto_ao_out[c] = 4.0
-
-            # === CENTRALIZED AO WRITE BLOCK ===
-            try:
-                ao_id = get_safe_int(config.get("ao_id", 9), 9)
-                with modbus_lock:
-                    instr_ao = create_instrument(ao_id)
-                    for c in range(8):
-                        is_manual = ao_manual.get(c, {}).get("active")
-                        target_ao = ao_manual[c]["val"] if is_manual else auto_ao_out.get(c, 4.0)
-                        
-                        out_val = int(target_ao * 1000)
-                        out_val = max(0, min(20000, out_val))
-                        
-                        try:
-                            reg_address = c + 2 
-                            read_with_retry(instr_ao.write_register, reg_address, out_val, 0, 6, retries=1)
-                            time.sleep(0.05) 
-                        except Exception: pass
-            except Exception: pass
 
             # === LOGS WRITING (NOW SAVES KEYS AS HEADERS) ===
             if all_keys:
@@ -558,7 +594,7 @@ def get_all(log_start: str = None, log_end: str = None):
         "1hr": read_tail(LOG_1HR, 30, log_start, log_end),
         "alarm": read_tail(LOG_ALARM, 50, log_start, log_end)
     }
-    return {"data": sensor_data, "history": history_data, "relays": relay_states, "ao_manual": ao_manual, "config": config, "logs": logs}
+    return {"data": sensor_data, "history": history_data, "relays": relay_states, "di_states": di_states, "ai_states": ai_states, "ao_manual": ao_manual, "config": config, "logs": logs}
 
 @app.post("/api/save_config")
 async def update_cfg(request: Request):
@@ -621,7 +657,7 @@ def toggle_relay(key: str, state: int):
         try:
             with modbus_lock:
                 instr = create_instrument(act["modbus_id"])
-                read_with_retry(instr.write_bit, act["ch"], state, 5, retries=2)
+                read_with_retry(instr.write_bit, act["ch"], state, functioncode=5, retries=2)
         except: pass
     return {"status": "ok"}
 
@@ -787,52 +823,62 @@ def set_cal(sensor_id: int, s_type: str, k: float, b: float):
             return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-        
+    
+@app.get("/api/detect_sensor")
+def detect_sensor(s_type: str):
+    try:
+        with modbus_lock:
+            for i in range(1, 61):
+                instr = create_instrument(i)
+                instr.serial.timeout = 0.08  
+                reg = 25 if s_type == 'mlss' else 12288
+                try:
+                    instr.read_register(reg, 0)
+                    return {"status": "ok", "id": i}
+                except Exception:
+                    pass
+        return {"status": "error", "message": "No response"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.get("/api/change_sensor_id")
 def change_sensor_id(curr_id: int, new_id: int, s_type: str):
     try:
         with modbus_lock:
             instr = create_instrument(curr_id)
+            instr.serial.timeout = 0.5
             
             if s_type == 'io_module':
-                try:
-                    current_reg = instr.read_register(0, 0)
-                    baud_rate_code = current_reg & 0x00FF  
-                    new_val = (new_id << 8) | baud_rate_code 
-                    instr.write_register(0, new_val, 0, functioncode=6)
-                except Exception:
-                    fallback_val = (new_id << 8) | 3
-                    try:
-                        instr.write_register(0, fallback_val, 0, functioncode=6)
-                    except Exception as e2:
-                        return {"status": "error", "message": str(e2)}
+                try: instr.write_register(128, new_id, 0, functioncode=6)
+                except: pass
                 return {"status": "ok"}
 
             id_register = 25 if s_type == 'mlss' else 12288
+            
             try:
                 current_reg = instr.read_register(id_register, 0)
             except Exception:
-                try:
-                    instr.address = 255
-                    current_reg = instr.read_register(id_register, 0)
-                except Exception:
-                    return {"status": "error", "message": "Timeout. Cannot read sensor."}
+                current_reg = curr_id
             
-            if s_type == 'mlss':
-                write_val = new_id
-            else:
-                if current_reg >= 256: 
-                    baud_rate = current_reg & 0x00FF
-                    write_val = (new_id << 8) | baud_rate
-                else:
-                    write_val = new_id
+            write_val = new_id
+            if s_type != 'mlss' and current_reg >= 256:
+                baud_rate = current_reg & 0x00FF
+                write_val = (new_id << 8) | baud_rate
 
             try:
                 instr.write_register(id_register, write_val, 0, functioncode=6)
             except Exception:
-                pass 
-                
-            return {"status": "ok"}
+                pass
+            
+            time.sleep(0.5) 
+            
+            try:
+                test_instr = create_instrument(new_id)
+                test_instr.serial.timeout = 0.5
+                test_instr.read_register(id_register, 0)
+                return {"status": "ok"}
+            except Exception:
+                return {"status": "error", "message": "ID changed, but sensor is not responding on new address."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -841,30 +887,38 @@ def scan_io_module(module_type: str):
     try:
         known_sensors = [get_safe_int(s.get("id")) for s in config.get("sensors", {}).values()]
         
-        if module_type == 'relay':
-            ignore_id = get_safe_int(config.get("ao_id", 9), 9)
-        else:
-            ignore_id = get_safe_int(config.get("relay_id", 8), 8)
-            
         with modbus_lock:
-            for i in range(1, 100):
-                if i in known_sensors or i == ignore_id: 
-                    continue
-                
-                instr = create_instrument(i)
-                instr.serial.timeout = 0.05  
-                
-                try:
-                    if module_type == 'ao':
-                        instr.read_register(560, 0, 3)
-                    else:
-                        instr.read_bit(0, 1)
-                    return {"status": "ok", "id": i}
-                except minimalmodbus.IllegalRequestError:
-                    return {"status": "ok", "id": i}
-                except Exception: 
-                    pass
+            instr = create_instrument(1) 
+            original_timeout = instr.serial.timeout
+            instr.serial.timeout = 0.15 
+            
+            try:
+                for i in range(1, 100):
+                    if i in known_sensors: 
+                        continue
                     
+                    instr.address = i
+                    
+                    try:
+                        if module_type == 'ao':
+                            instr.read_register(0, functioncode=4)
+                            return {"status": "ok", "id": i}
+                        else:
+                            try:
+                                instr.read_register(0, functioncode=4)
+                                is_ao = True
+                            except Exception:
+                                is_ao = False
+                                
+                            if not is_ao:
+                                instr.read_bit(0, functioncode=1)
+                                return {"status": "ok", "id": i}
+                    except Exception:
+                        pass
+                        
+            finally:
+                instr.serial.timeout = original_timeout
+                
         return {"status": "error", "message": "Module not found on bus"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -883,11 +937,11 @@ def get_gui():
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
         <title>Smart Farm Pro</title>
-        <script src="/static/tailwind.js"></script>
+        <script src="https://cdn.tailwindcss.com"></script>
         <script>
             tailwind.config = { darkMode: 'class' }
         </script>
-        <script src="/static/chart.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             html { font-size: 16px; }
             @media (max-width: 1280px) { html { font-size: 14px; } }
@@ -1041,6 +1095,23 @@ def get_gui():
                 <div id="ctrl-relay-grid" class="grid grid-cols-2 gap-8">
                     </div>
             </div>
+            
+            <!-- НОВАЯ КАРТОЧКА ДЛЯ AI -->
+            <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-8 w-full max-w-4xl border-t-4 border-t-indigo-500 dark:border-t-indigo-900/30 shrink-0 mb-8">
+                <h2 class="text-indigo-600 dark:text-indigo-400 font-black text-xl mb-6 uppercase border-b border-slate-300 dark:border-slate-700 pb-4" data-i18n="ai_title">AI (ANALOG INPUTS)</h2>
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <script>
+                        for(let i=0; i<8; i++) {
+                            document.write(`
+                            <div class="flex items-center justify-between bg-slate-50 dark:bg-slate-800/40 p-3.5 rounded-xl border border-slate-300 dark:border-slate-700/50 shadow-sm">
+                                <span class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase">CH ${i}</span>
+                                <span id="ai-val-${i}" class="font-mono text-indigo-600 dark:text-indigo-400 font-black text-sm tracking-wider">-- mA</span>
+                            </div>
+                            `);
+                        }
+                    </script>
+                </div>
+            </div>
 
             <div class="card bg-white dark:bg-[#0f172a] border border-slate-300 dark:border-[#1e293b] rounded-lg p-8 w-full max-w-4xl border-t-4 border-t-fuchsia-500 dark:border-t-fuchsia-900/30 shrink-0 mb-8">
                 <h2 class="text-fuchsia-600 dark:text-fuchsia-400 font-black text-xl mb-6 uppercase border-b border-slate-300 dark:border-slate-700 pb-4" data-i18n="manual_ao">Manual Analog Output</h2>
@@ -1055,7 +1126,7 @@ def get_gui():
                                         <span class="text-[10px] font-black text-slate-400 uppercase tracking-widest">AUTO</span>
                                         <label class="relative inline-flex items-center cursor-pointer">
                                             <input type="checkbox" id="ao-toggle-${i}" onchange="updateAoManual(${i})" class="sr-only peer">
-                                            <div class="w-10 h-5 bg-slate-300 dark:bg-slate-700 rounded-full peer-checked:bg-fuchsia-500 transition-colors after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-[20px]"></div>
+                                            <div class="w-9 h-5 bg-slate-300 dark:bg-slate-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-fuchsia-500"></div>
                                         </label>
                                         <span class="text-[10px] font-black text-fuchsia-500 uppercase tracking-widest">MANUAL</span>
                                     </div>
@@ -1186,9 +1257,22 @@ def get_gui():
                         </div>
                     </div>
                     
+                    <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded border border-slate-200 dark:border-slate-700 mt-4">
+                        <div class="flex justify-between items-end mb-3">
+                            <span class="text-[10px] text-slate-400 font-bold uppercase tracking-widest">AO OFFSET CALIBRATION (mA)</span>
+                        </div>
+                        <div class="flex items-center border border-slate-300 dark:border-slate-600 rounded overflow-hidden shadow-sm bg-white dark:bg-slate-800">
+                            <button onclick="stepVal('eng-ao-offset', -0.1)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">-</button>
+                            <input type="number" id="eng-ao-offset" step="0.1" class="w-full bg-transparent text-center py-2 text-slate-900 dark:text-white text-lg font-bold outline-none">
+                            <button onclick="stepVal('eng-ao-offset', 0.1)" class="w-12 py-2 bg-slate-100 dark:bg-slate-700 text-lg font-black hover:bg-slate-200 dark:hover:bg-slate-600 no-select transition-colors">+</button>
+                        </div>
+                        <p class="text-[9px] text-slate-500 mt-2 leading-tight">플러그인의 하드웨어 오류를 방지하려면 이 상자를 사용하십시오. 예를 들어 4.0mA에서 멀티미터가 3.3mA를 표시할 경우 여기에 0.7을 입력하십시오.</p>
+                    </div>
+                    
                 </div>
                 <div class="flex justify-end gap-3 mt-6">
                     <button onclick="closeIoModal()" class="px-6 py-2.5 bg-slate-200 dark:bg-slate-700 rounded text-sm font-bold text-slate-800 dark:text-white hover:bg-slate-300 border border-slate-300 dark:border-slate-600 shadow-sm" data-i18n="close">CLOSE</button>
+                    <button onclick="applyIoIds()" class="px-6 py-2.5 bg-indigo-600 rounded text-sm font-bold text-white hover:bg-indigo-500 border border-indigo-700 shadow-sm">APPLY ID</button>
                 </div>
             </div>
         </div>
@@ -1253,7 +1337,12 @@ def get_gui():
                         </select>
                     </div>
                     <div>
-                        <label class="block text-xs font-bold text-slate-500 dark:text-slate-400 mb-1.5" data-i18n="current_id">CURRENT ID (255=Broadcast)</label>
+                        <div class="flex justify-between items-end mb-1.5">
+                            <label class="block text-xs font-bold text-slate-500 dark:text-slate-400" data-i18n="current_id">CURRENT ID (255=Broadcast)</label>
+                            <button id="btn-scan-sensor" onclick="autoDetectSensor()" class="px-2 py-1 bg-indigo-100 text-indigo-600 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-400 rounded text-[9px] font-black uppercase tracking-wider transition-colors border border-indigo-200 dark:border-indigo-800">
+                                AUTO DETECT
+                            </button>
+                        </div>
                         <input type="number" id="tool-curr-id" value="255" class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded p-2 text-slate-900 dark:text-white font-bold text-base focus:outline-none focus:border-blue-500 text-center">
                     </div>
                     <div>
@@ -1614,6 +1703,7 @@ def get_gui():
 
                 hide() {
                     if (this.activeInput) {
+                        this.activeInput.dispatchEvent(new Event('change', { bubbles: true }));
                         this.activeInput.blur(); 
                         this.activeInput = null;
                     }
@@ -1668,7 +1758,13 @@ def get_gui():
                     if(!this.activeInput) return;
                     
                     if(key === 'Shift') { this.isShift = !this.isShift; this.render(); return; }
-                    if(key === 'Enter') { this.hide(); if (this.activeInput.id === 'admin-pwd-input') verifyAdmin(); if (this.activeInput.id === 'mfg-pwd-input') verifyMfgPwd(); return; }
+                    if(key === 'Enter') { 
+                        const inputId = this.activeInput.id;
+                        this.hide();
+                        if (inputId === 'admin-pwd-input') verifyAdmin(); 
+                        if (inputId === 'mfg-pwd-input') verifyMfgPwd(); 
+                        return; 
+                    }
 
                     let val = this.activeInput.value;
 
@@ -1782,7 +1878,7 @@ def get_gui():
                     contam_label: "Contamination: ", contam_setup: "CONTAMINATION SETUP",
                     contam_enable: "Enable Contamination Alert", contam_cycle: "Cycle (Months)", reset_timer: "RESET TIMER (0%)", save_setup: "SAVE SETUP",
                     mfg_login: "WARNING: Arbitrary changes may cause system failure. Contact Manufacturer.", enter: "ENTER", off: "OFF",
-                    ao_mapping: "AO Port Mapping"
+                    ao_mapping: "AO Port Mapping", ai_title: "AI (ANALOG INPUTS)"
                 },
                 ko: {
                     nav_dash: "감시화면", nav_trends: "트렌드", nav_logs: "자료조회", nav_ctrl: "제어", nav_setup: "설정", theme: "테마", exit: "종료",
@@ -1809,7 +1905,7 @@ def get_gui():
                     contam_label: "센서 오염도: ", contam_setup: "오염도 알람 설정",
                     contam_enable: "오염도 알람 사용", contam_cycle: "교체 주기 (개월)",
                     reset_timer: "시간 초기화 (0%)", save_setup: "설정 저장", mfg_login: "임의적으로 조작시 문제가 발생할 수 있으니 제조사 연락바랍니다.", enter: "확인", off: "꺼짐",
-                    ao_mapping: "아날로그 출력 (AO) 포트 매핑"
+                    ao_mapping: "아날로그 출력 (AO) 포트 매핑", ai_title: "아날로그 입력 (AI)"
                 }
             };
 
@@ -1858,11 +1954,6 @@ def get_gui():
                 if(!configData.sensors) configData.sensors = {};
                 if(!configData.relay_actions) configData.relay_actions = {};
                 if(!configData.ao_map) configData.ao_map = {};
-                
-                const relayEl = document.getElementById('eng-relay-id');
-                if(relayEl) configData.relay_id = parseInt(relayEl.value) || 0;
-                const aoEl = document.getElementById('eng-ao-id');
-                if(aoEl) configData.ao_id = parseInt(aoEl.value) || 0;
                 
                 if(document.getElementById('sys-t-sensor')) {
                     configData.sys_temp.sensor = document.getElementById('sys-t-sensor').value;
@@ -2108,8 +2199,10 @@ def get_gui():
             function openIoModal() {
                 document.getElementById('eng-relay-id').value = configData.relay_id;
                 document.getElementById('eng-ao-id').value = configData.ao_id;
+                document.getElementById('eng-ao-offset').value = configData.ao_offset || 0.0;
                 document.getElementById('io-modal-overlay').classList.remove('hidden');
             }
+            
             function closeIoModal() { document.getElementById('io-modal-overlay').classList.add('hidden'); }
 
             let isDark = true; 
@@ -2169,6 +2262,36 @@ def get_gui():
                 document.querySelectorAll('.log-tab-btn').forEach(b => b.classList.remove('active'));
                 document.getElementById('btn-v-' + view).classList.add('active');
                 update();
+            }
+            
+            async function autoDetectSensor() {
+                const sType = document.getElementById('tool-s-type').value;
+                const btn = document.getElementById('btn-scan-sensor');
+                
+                btn.innerHTML = "SCANNING...";
+                btn.className = "px-2 py-1 bg-amber-100 text-amber-700 border-amber-200 rounded text-[9px] font-black uppercase tracking-wider transition-colors border";
+                
+                try {
+                    const res = await fetch(`/api/detect_sensor?s_type=${sType}`);
+                    const data = await res.json();
+                    
+                    if(data.status === 'ok') {
+                        document.getElementById('tool-curr-id').value = data.id;
+                        btn.innerHTML = `FOUND: ID ${data.id}`;
+                        btn.className = "px-2 py-1 bg-emerald-100 text-emerald-700 border-emerald-200 rounded text-[9px] font-black uppercase tracking-wider transition-colors border";
+                    } else {
+                        btn.innerHTML = "NOT FOUND";
+                        btn.className = "px-2 py-1 bg-rose-100 text-rose-700 border-rose-200 rounded text-[9px] font-black uppercase tracking-wider transition-colors border";
+                    }
+                } catch(e) {
+                    btn.innerHTML = "ERROR";
+                    btn.className = "px-2 py-1 bg-rose-100 text-rose-700 border-rose-200 rounded text-[9px] font-black uppercase tracking-wider transition-colors border";
+                }
+                
+                setTimeout(() => {
+                    btn.innerHTML = "AUTO DETECT";
+                    btn.className = "px-2 py-1 bg-indigo-100 text-indigo-600 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-400 rounded text-[9px] font-black uppercase tracking-wider transition-colors border border-indigo-200 dark:border-indigo-800";
+                }, 3000);
             }
 
             async function openExportModal() {
@@ -2744,7 +2867,7 @@ def get_gui():
                             <div class="flex items-center gap-3 w-full pr-2">
                                 <label class="relative inline-flex items-center cursor-pointer shrink-0">
                                     <input type="checkbox" id="en-${key}" onchange="toggleSensorEnabled('${key}', this.checked)" ${s.enabled ? 'checked' : ''} class="sr-only peer">
-                                    <div class="w-12 h-6 bg-slate-300 dark:bg-slate-900 rounded-full border border-slate-400 dark:border-slate-600 peer-checked:bg-emerald-500 transition-colors after:absolute after:top-[1px] after:left-[2px] after:bg-white dark:after:bg-slate-400 after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-[24px] peer-checked:after:bg-white"></div>
+                                    <div class="w-12 h-6 bg-slate-300 dark:bg-slate-900 rounded-full border border-slate-400 dark:border-slate-600 peer-checked:bg-emerald-500 transition-colors after:absolute after:top-[1px] after:left-[2px] after:bg-white dark:after:bg-slate-400 after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-6 peer-checked:after:bg-white"></div>
                                 </label>
                                 <input type="color" id="color-${key}" onchange="triggerSave()" value="${s.color}" class="bg-transparent w-6 h-6 rounded cursor-pointer shrink-0" title="Change Sensor Color">
                                 <input id="label-${key}" onchange="triggerSave()" type="text" value="${s.label}" class="editable-label text-sm font-black uppercase truncate flex-1 min-w-[50px] px-1 text-slate-800 dark:text-white" style="color: ${s.color}">
@@ -2867,7 +2990,7 @@ def get_gui():
                     <div class="flex items-center gap-3 bg-slate-50 dark:bg-slate-800/50 p-2.5 rounded border border-slate-200 dark:border-slate-700">
                         <label class="relative inline-flex items-center cursor-pointer shrink-0">
                             <input type="checkbox" id="rel-en-${rKey}" onchange="triggerSave()" ${r.enabled ? 'checked' : ''} class="sr-only peer">
-                            <div class="w-9 h-5 bg-slate-300 dark:bg-slate-600 rounded-full peer-checked:bg-purple-500 after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-[16px]"></div>
+                            <div class="w-9 h-5 bg-slate-300 dark:bg-slate-600 rounded-full peer-checked:bg-purple-500 after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-5"></div>
                         </label>
                         <div class="flex flex-col gap-1 w-16 shrink-0">
                             <span class="text-[9px] text-slate-400 font-bold uppercase tracking-widest leading-none" data-i18n="modbus_id_short">ID</span>
@@ -2886,26 +3009,51 @@ def get_gui():
                 }
                 relaysEngHTML += `<button onclick="addRelayAction()" class="mt-2 w-full py-2 bg-purple-100 text-purple-700 hover:bg-purple-200 dark:bg-purple-900/30 dark:text-purple-400 dark:hover:bg-purple-800/50 rounded text-xs font-black uppercase tracking-wider transition-colors border border-purple-200 dark:border-purple-800 border-dashed" data-i18n="add_action">+ ADD NEW ACTION</button>`;
 
-                let ctrlHTML = '';
+                let ctrlHTML = `
+                <div class="flex flex-col xl:flex-row gap-6 w-full">
+                    <div class="xl:w-1/3 flex flex-col gap-4 shrink-0">
+                        <!-- DI Block -->
+                        <div class="bg-slate-50 dark:bg-slate-800/20 border border-slate-300 dark:border-slate-700/50 rounded-xl p-5 border-t-4 border-t-emerald-500 shadow-sm flex flex-col">
+                            <h2 class="text-emerald-600 dark:text-emerald-500 font-black text-sm mb-4 uppercase tracking-wider">DI (DIGITAL INPUTS)</h2>
+                            <div class="grid grid-cols-2 gap-3 mt-auto">
+                                ${Array.from({length: 8}, (_, i) => `
+                                <div class="flex items-center justify-between bg-white dark:bg-slate-800 p-2 rounded-lg border border-slate-200 dark:border-slate-700 shadow-sm">
+                                    <span class="text-[10px] font-bold text-slate-500 dark:text-slate-400">CH ${i}</span>
+                                    <div id="di-ind-${i}" class="w-3 h-3 rounded-full bg-slate-300 dark:bg-slate-600 transition-colors"></div>
+                                </div>`).join('')}
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="xl:w-2/3 grid grid-cols-1 md:grid-cols-2 gap-4">
+                `;
+                
                 for(const [rKey, r] of Object.entries(configData.relay_actions || {})) {
                     if(r.enabled) {
                         ctrlHTML += `
-                        <div class="flex items-center justify-between bg-slate-100 dark:bg-slate-800/40 p-5 rounded-xl border border-slate-300 dark:border-slate-700/50 shadow-sm">
-                            <div class="flex flex-col">
-                                <span class="text-sm font-bold text-slate-700 dark:text-slate-300 uppercase pr-4">${r.label}</span>
-                                <span class="text-[10px] font-black text-slate-400 uppercase tracking-widest">ID: ${r.modbus_id} | CH: ${r.ch}</span>
+                        <div class="flex items-center justify-between bg-slate-50 dark:bg-slate-800/40 p-4 rounded-xl border border-slate-300 dark:border-slate-700/50 shadow-sm">
+                            <div class="flex flex-col overflow-hidden pr-2">
+                                <span class="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase truncate">${r.label}</span>
+                                <span class="text-[9px] font-black text-slate-400 uppercase tracking-widest mt-0.5">ID: ${r.modbus_id} | CH: ${r.ch}</span>
                             </div>
                             <label class="relative inline-flex items-center cursor-pointer shrink-0">
                                 <input type="checkbox" id="relay-toggle-${rKey}" onchange="fetch('/api/relay?key=${rKey}&state='+(this.checked?1:0))" class="sr-only peer">
-                                <div class="w-14 h-7 bg-slate-300 dark:bg-slate-900 rounded-full border border-slate-400 dark:border-slate-600 peer-checked:bg-cyan-500 transition-colors after:content-[''] after:absolute after:top-[3px] after:left-[3px] after:bg-white dark:after:bg-slate-400 after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-[28px] peer-checked:after:bg-white"></div>
+                                <div class="w-11 h-6 bg-slate-300 dark:bg-slate-700 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-500 shadow-inner"></div>
                             </label>
                         </div>`;
                     }
                 }
                 
+                ctrlHTML += `
+                    </div>
+                </div>`;
+                
                 const ctrlGrid = document.getElementById('ctrl-relay-grid');
-                if(ctrlGrid) ctrlGrid.innerHTML = ctrlHTML || '<div class="col-span-2 text-center text-slate-500 font-bold py-10" data-i18n="no_relays">No active relays</div>';
-
+                if(ctrlGrid) {
+                    ctrlGrid.innerHTML = ctrlHTML || '<div class="text-center text-slate-500 font-bold py-10" data-i18n="no_relays">No active relays</div>';
+                    ctrlGrid.className = "w-full"; 
+                }
+                
                 document.getElementById('eng-sensors').innerHTML = engHTML;
                 document.getElementById('eng-ao-scaling').innerHTML = aoMapHTML + sysTempHTML + aoHTML;
                 document.getElementById('eng-relays-list').innerHTML = relaysEngHTML;
@@ -3124,6 +3272,35 @@ def get_gui():
                             if(toggle && document.activeElement !== toggle) toggle.checked = (d.relays[rKey] === 1);
                         }
                         
+                        if (d.di_states) {
+                            for(let i=0; i<8; i++) {
+                                const ind = document.getElementById('di-ind-' + i);
+                                if(ind) {
+                                    ind.className = d.di_states[i] === 1 
+                                        ? "w-3.5 h-3.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.8)]" 
+                                        : "w-3.5 h-3.5 rounded-full bg-slate-300 dark:bg-slate-600 transition-colors";
+                                }
+                            }
+                        }
+                        
+                        // --- ОБНОВЛЕНИЕ AI ---
+                        if (d.ai_states) {
+                            for(let i=0; i<8; i++) {
+                                const aiEl = document.getElementById('ai-val-' + i);
+                                if (aiEl) {
+                                    if (d.ai_states[i] === "Err") {
+                                        aiEl.innerText = "Err";
+                                        aiEl.classList.add("text-rose-500");
+                                        aiEl.classList.remove("text-indigo-600", "dark:text-indigo-400");
+                                    } else {
+                                        aiEl.innerText = parseFloat(d.ai_states[i]).toFixed(2) + ' mA';
+                                        aiEl.classList.remove("text-rose-500");
+                                        aiEl.classList.add("text-indigo-600", "dark:text-indigo-400");
+                                    }
+                                }
+                            }
+                        }
+                        
                         for(let i=0; i<8; i++) {
                             const ao = d.ao_manual[i];
                             if(ao) {
@@ -3313,6 +3490,27 @@ def get_gui():
                 document.getElementById('contam-setup-modal').classList.add('hidden');
                 initDynamicUI();
             }            
+            
+            async function applyIoIds() {
+                const newRelayId = parseInt(document.getElementById('eng-relay-id').value) || 8;
+                const newAoId = parseInt(document.getElementById('eng-ao-id').value) || 9;
+                const newAoOffset = parseFloat(document.getElementById('eng-ao-offset').value) || 0.0;
+                
+                configData.relay_id = newRelayId;
+                configData.ao_id = newAoId;
+                configData.ao_offset = newAoOffset;
+                
+                for (let k in configData.relay_actions) {
+                    configData.relay_actions[k].modbus_id = newRelayId;
+                    const inputEl = document.getElementById('rel-mid-' + k);
+                    if (inputEl) inputEl.value = newRelayId;
+                }
+                
+                await triggerSave();
+                customAlert(configData.lang === 'ko' ? "I/O 설정이 적용되었습니다!" : "I/O Setup Applied Successfully!");
+                initDynamicUI();
+                closeIoModal();
+            }
         </script>
     </body>
     </html>
@@ -3338,6 +3536,7 @@ class JsApi:
 js_api = JsApi()
 
 if __name__ == "__main__":
+    threading.Thread(target=io_worker, daemon=True).start()
     threading.Thread(target=modbus_worker, daemon=True).start()
     threading.Thread(target=cleaning_worker, daemon=True).start()
     threading.Thread(target=run_api, daemon=True).start()
