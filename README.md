@@ -1,7 +1,3 @@
-Конечно, вот готовый профессиональный README.md на английском языке для твоего репозитория на GitHub. Как ты и просил, я полностью вырезал раздел про создание ярлыка (desktop shortcut) и обновил нумерацию.
-
-Скопируй этот текст в свой файл README.md:
-
 Smart Water Analyzer — Technical Guide & User Manual
 A comprehensive system for water quality monitoring and industrial automation based on Raspberry Pi / Linux, Modbus RTU (RS-485), FastAPI, pywebview, and TailwindCSS.
 
